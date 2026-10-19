@@ -818,13 +818,17 @@ def tampil_leaderboard(kode_saya):
     if me.empty:
         return
     rank, total = int(me.peringkat.iloc[0]), int(me.total.iloc[0])
-    if total > 0 and rank <= 3:
-        st.success(f"🎉 Toko Anda di peringkat **{rank}**! Pertahankan posisi Anda!")
-    else:
-        batas = int(juara.total.iloc[-1]) if len(juara) == 3 else 0
-        kurang = max(batas - total + 1, 1)
-        st.info(f"Toko Anda di peringkat **{rank}** dari {len(lb)} toko. Kurang "
-                f"**{poin(kurang)}** lagi untuk masuk Top 3! 🚀")
+    atas = lb[lb.total > total]
+    if atas.empty:
+        if total > 0:
+            st.success(f"👑 Toko Anda **juara {rank}** dari {len(lb)} toko! Pertahankan!")
+        return
+    di_atas = atas.iloc[-1]  # toko dengan poin terdekat di atas kita
+    selisih = int(di_atas.total) - total
+    teks = (f"Toko Anda di peringkat **{rank}** dari {len(lb)} toko. Selisih "
+            f"**{poin(selisih)}** dengan peringkat {int(di_atas.peringkat)} "
+            f"(**{di_atas.nama_toko}**). Ayo kejar! 🚀")
+    (st.success if total > 0 and rank <= 3 else st.info)(teks)
 
 
 # ================== FOTO PROFIL ==================
@@ -914,6 +918,35 @@ def toko_profil():
             st.session_state.profil_ver = v + 1
             st.toast("Foto profil diperbarui!")
             st.rerun()
+
+
+# ================== PILIHAN IKON ==================
+IKON_PILIHAN = [
+    # rokok & toko
+    "🚬", "🏪", "🛒", "🧾", "📦", "🏬", "🏠", "🛍️", "💳", "🏷️", "🪧", "📋",
+    # promosi / POSM
+    "📌", "📍", "📣", "📢", "🎪", "⛱️", "🪟", "🖼️", "🎏", "🎌", "🚩", "🏁",
+    # hadiah & poin
+    "🎁", "🎉", "🎊", "🏆", "🥇", "🏅", "🎖️", "👑", "💎", "💰", "💵", "🪙",
+    # semangat
+    "⭐", "🌟", "✨", "🔥", "⚡", "🚀", "💪", "👍", "🎯", "✅", "💯", "❤️",
+    # foto & kegiatan
+    "📷", "📸", "🤳", "👀", "🔍", "📅", "🗓️", "⏰", "🔔", "💡", "🤝", "🙏",
+    # lain-lain
+    "☕", "🥤", "🍜", "🛵", "🚚", "🏍️", "🌙", "☀️", "🌈", "🍀", "🎲", "🎮",
+]
+
+
+def pilih_ikon(key, awal="📌"):
+    """Pilih ikon dari daftar emoji (klik), atau ketik emoji sendiri."""
+    opsi = IKON_PILIHAN if awal in IKON_PILIHAN else [awal] + IKON_PILIHAN
+    if hasattr(st, "pills"):
+        pilih = st.pills("Ikon program (klik salah satu)", opsi, default=awal, key=f"{key}_pills")
+    else:
+        pilih = st.selectbox("Ikon program", opsi, index=opsi.index(awal), key=f"{key}_sel")
+    lain = st.text_input("…atau ketik/tempel emoji lain (opsional)", key=f"{key}_lain",
+                         max_chars=8).strip()
+    return lain or pilih or awal
 
 
 # ================== HELPER ==================
@@ -1747,9 +1780,8 @@ def sales_program():
             return None
 
     with st.form(f"form_edit_{kode_p}"):
-        c1, c2 = st.columns([1, 4])
-        ikon = c1.text_input("Ikon", value=p["ikon"]).strip()
-        nama = c2.text_input("Nama program *", value=p["nama"]).strip()
+        nama = st.text_input("Nama program *", value=p["nama"]).strip()
+        ikon = pilih_ikon(f"ikon_edit_{kode_p}", p["ikon"] or "📌")
         c3, c4 = st.columns(2)
         jml = c3.number_input("Poin per klaim *" if misi else "Poin per pack *",
                               min_value=1, value=max(int(p["poin"]), 1), step=50 if misi else 10)
@@ -1806,7 +1838,7 @@ def sales_program():
     with st.expander("➕ Tambah misi foto baru"):
         with st.form("form_misi_baru", clear_on_submit=True):
             nama = st.text_input("Nama misi *", placeholder="mis. POSM Poster").strip()
-            ikon = st.text_input("Ikon (emoji)", value="📌").strip()
+            ikon = pilih_ikon("ikon_baru", "📌")
             jml = st.number_input("Poin per klaim *", min_value=1, value=500, step=50)
             frek_baru = st.selectbox("Batas klaim per toko", list(FREKUENSI), index=1,
                                      format_func=FREKUENSI.get)
