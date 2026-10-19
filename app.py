@@ -1623,65 +1623,77 @@ def toko_misi():
 # ================== ADMIN: ATUR PROGRAM ==================
 def sales_program():
     st.subheader("⚙️ Atur Program Poin")
-    st.caption("Ubah langsung di tabel lalu klik **Simpan**. Tanggal kosong = tanpa batas. "
-               "Perubahan poin hanya berlaku untuk pengajuan baru; poin yang sudah "
-               "tercatat tidak berubah.")
+    st.caption("Tanggal kosong = tanpa batas. Perubahan poin hanya berlaku untuk pengajuan "
+               "baru; poin yang sudah tercatat tidak berubah.")
+    if msg := st.session_state.pop("prog_ok", None):
+        st.success(msg)
     df = program_df()
-    tabel_edit = pd.DataFrame({
-        "kode": df.kode,
-        "Ikon": df.ikon,
-        "Nama": df.nama,
-        "Jenis": df.jenis.map({"pembelian": "Pembelian (poin/pack)",
-                               "misi": "Misi foto (poin/klaim)"}).fillna(df.jenis),
-        "Poin": df.poin,
-        "Aktif": df.aktif.eq("ya"),
-        "Mulai": pd.to_datetime(df.mulai.str[:10], errors="coerce"),
-        "Selesai": pd.to_datetime(df.selesai.str[:10], errors="coerce"),
-        "Isian wajib": df.keterangan,
-        "Petunjuk foto": df.deskripsi,
-        "Status": [_status_program(r) for _, r in df.iterrows()],
-    })
-    hasil = st.data_editor(
-        tabel_edit, hide_index=True, use_container_width=True, num_rows="fixed",
-        key="prog_editor", disabled=["Jenis", "Status"],
-        column_config={
-            "kode": None,
-            "Poin": st.column_config.NumberColumn(min_value=1, step=50, required=True),
-            "Aktif": st.column_config.CheckboxColumn(),
-            "Mulai": st.column_config.DateColumn(format="DD-MM-YYYY"),
-            "Selesai": st.column_config.DateColumn(format="DD-MM-YYYY"),
-            "Isian wajib": st.column_config.TextColumn(
-                help="Kosongkan jika toko cukup kirim foto. Isi label (mis. 'Brand rokok "
-                     "yang diecer') jika toko wajib mengetik keterangan."),
-        },
+
+    # Ringkasan semua program (hanya tampilan)
+    st.dataframe(
+        pd.DataFrame({
+            "Program": df.ikon + " " + df.nama,
+            "Jenis": df.jenis.map({"pembelian": "Pembelian", "misi": "Misi foto"}).fillna(df.jenis),
+            "Poin": df.poin.astype(str) + df.jenis.map({"pembelian": " /pack"}).fillna(" /klaim"),
+            "Periode": [periode_program(r).replace("📅 ", "") for _, r in df.iterrows()],
+            "Status": [_status_program(r) for _, r in df.iterrows()],
+        }),
+        hide_index=True, use_container_width=True,
     )
-    if st.button("💾 Simpan Program", type="primary", use_container_width=True):
-        def iso(x):
-            return "" if pd.isna(x) else pd.Timestamp(x).date().isoformat()
-        rows, salah = [], []
-        now = now_wib().isoformat(timespec="seconds")
-        for (_, asal), (_, baru) in zip(df.iterrows(), hasil.iterrows()):
-            mulai, selesai = iso(baru["Mulai"]), iso(baru["Selesai"])
-            if mulai and selesai and mulai > selesai:
-                salah.append(baru["Nama"])
-            berubah = (int(baru["Poin"]) != int(asal["poin"]) or baru["Aktif"] != (asal["aktif"] == "ya")
-                       or mulai != asal["mulai"][:10] or selesai != asal["selesai"][:10]
-                       or baru["Nama"] != asal["nama"] or baru["Ikon"] != asal["ikon"]
-                       or baru["Isian wajib"] != asal["keterangan"]
-                       or baru["Petunjuk foto"] != asal["deskripsi"])
-            rows.append([asal["kode"], str(baru["Nama"]).strip(), str(baru["Ikon"]).strip(),
-                         asal["jenis"], int(baru["Poin"]), "ya" if baru["Aktif"] else "tidak",
-                         mulai, selesai, str(baru["Isian wajib"] or "").strip(),
-                         str(baru["Petunjuk foto"] or "").strip(),
-                         st.session_state.nama if berubah else asal["diubah_oleh"],
-                         now if berubah else asal["diubah_pada"]])
-        if salah:
-            st.error("Tanggal mulai lebih besar dari tanggal selesai: " + ", ".join(salah))
-        else:
-            with st.spinner("Menyimpan..."):
-                simpan_program(rows)
-            st.success("✅ Program tersimpan.")
-            st.rerun()
+
+    # Edit satu program lewat form
+    st.markdown("### ✏️ Edit program")
+    opsi = {f"{r.ikon} {r.nama}": r.kode for r in df.itertuples()}
+    kode_p = opsi[st.selectbox("Pilih program yang mau diedit", list(opsi.keys()),
+                               key="edit_prog_pilih")]
+    p = df[df.kode == kode_p].iloc[0]
+    misi = p["jenis"] == "misi"
+
+    def ke_tgl(x):
+        try:
+            return datetime.fromisoformat(str(x)[:10]).date()
+        except ValueError:
+            return None
+
+    with st.form(f"form_edit_{kode_p}"):
+        c1, c2 = st.columns([1, 4])
+        ikon = c1.text_input("Ikon", value=p["ikon"]).strip()
+        nama = c2.text_input("Nama program *", value=p["nama"]).strip()
+        c3, c4 = st.columns(2)
+        jml = c3.number_input("Poin per klaim *" if misi else "Poin per pack *",
+                              min_value=1, value=max(int(p["poin"]), 1), step=50 if misi else 10)
+        aktif = c4.toggle("Program aktif", value=p["aktif"] == "ya")
+        c5, c6 = st.columns(2)
+        mulai = c5.date_input("Tanggal mulai (kosongkan = tanpa batas)",
+                              value=ke_tgl(p["mulai"]), format="DD-MM-YYYY")
+        selesai = c6.date_input("Tanggal selesai (kosongkan = tanpa batas)",
+                                value=ke_tgl(p["selesai"]), format="DD-MM-YYYY")
+        ket = st.text_input("Isian wajib untuk toko (kosongkan jika cukup foto)",
+                            value=p["keterangan"], disabled=not misi,
+                            placeholder="mis. Brand rokok yang diecer").strip() if misi else ""
+        desk = st.text_area("Petunjuk / deskripsi", value=p["deskripsi"]).strip()
+        st.caption(f"Terakhir diubah: {p['diubah_oleh'] or '-'} · {waktu(p['diubah_pada']) or '-'}")
+        if st.form_submit_button("💾 Simpan perubahan", type="primary", use_container_width=True):
+            if not nama:
+                st.error("Nama program wajib diisi.")
+            elif mulai and selesai and mulai > selesai:
+                st.error("Tanggal mulai tidak boleh setelah tanggal selesai.")
+            else:
+                now = now_wib().isoformat(timespec="seconds")
+                rows = []
+                for _, r in df.iterrows():
+                    if r["kode"] == kode_p:
+                        rows.append([kode_p, nama, ikon or "📌", r["jenis"], int(jml),
+                                     "ya" if aktif else "tidak",
+                                     mulai.isoformat() if mulai else "",
+                                     selesai.isoformat() if selesai else "",
+                                     ket, desk, st.session_state.nama, now])
+                    else:
+                        rows.append([r[c] for c in COLS["Program"]])
+                with st.spinner("Menyimpan..."):
+                    simpan_program(rows)
+                st.session_state.prog_ok = f"✅ Program {nama} tersimpan."
+                st.rerun()
 
     misi_ada = df[df.jenis == "misi"]
     if not misi_ada.empty:
