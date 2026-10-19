@@ -1792,10 +1792,17 @@ def sales_program():
                                 index=list(FREKUENSI).index(p["frekuensi"]),
                                 format_func=FREKUENSI.get)
         c5, c6 = st.columns(2)
-        mulai = c5.date_input("Tanggal mulai (kosongkan = tanpa batas)",
-                              value=ke_tgl(p["mulai"]), format="DD-MM-YYYY")
-        selesai = c6.date_input("Tanggal selesai (kosongkan = tanpa batas)",
-                                value=ke_tgl(p["selesai"]), format="DD-MM-YYYY")
+        # Kotak centang "tanpa batas": menghapus tanggal di kalender tidak bisa di Streamlit
+        mulai = c5.date_input("Tanggal mulai", value=ke_tgl(p["mulai"]) or today_wib(),
+                              format="DD-MM-YYYY")
+        tanpa_mulai = c5.checkbox("Tanpa tanggal mulai (langsung berlaku)",
+                                  value=not p["mulai"])
+        selesai = c6.date_input("Tanggal selesai", value=ke_tgl(p["selesai"]) or today_wib(),
+                                format="DD-MM-YYYY")
+        tanpa_selesai = c6.checkbox("Tanpa tanggal selesai (berlaku terus)",
+                                    value=not p["selesai"])
+        mulai = None if tanpa_mulai else mulai
+        selesai = None if tanpa_selesai else selesai
         ket = st.text_input("Isian wajib untuk toko (kosongkan jika cukup foto)",
                             value=p["keterangan"], disabled=not misi,
                             placeholder="mis. Brand rokok yang diecer").strip() if misi else ""
@@ -1844,8 +1851,9 @@ def sales_program():
                                      format_func=FREKUENSI.get)
             c1, c2 = st.columns(2)
             mulai = c1.date_input("Mulai", value=today_wib(), format="DD-MM-YYYY")
-            selesai = c2.date_input("Selesai (kosongkan = tanpa batas)", value=None,
-                                    format="DD-MM-YYYY")
+            selesai = c2.date_input("Selesai", value=today_wib(), format="DD-MM-YYYY")
+            tanpa_selesai = c2.checkbox("Tanpa tanggal selesai (berlaku terus)", value=True)
+            selesai = None if tanpa_selesai else selesai
             ket = st.text_input("Isian wajib (opsional)",
                                 placeholder="mis. Brand rokok yang diecer").strip()
             desk = st.text_input("Petunjuk foto",
