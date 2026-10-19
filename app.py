@@ -1,3 +1,4 @@
+
 """
 Aplikasi Poin Toko - Program Loyalitas Pembelian Rokok
 Aturan: 1 nota = min 1 pack, max 1 slop (10 pack). 1 pack = 100 poin.
@@ -6,10 +7,22 @@ Jalankan: streamlit run app.py
 """
 import hashlib
 import sqlite3
-from datetime import datetime, date
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+
+WIB = ZoneInfo("Asia/Jakarta")
+
+
+def now_wib():
+    """Waktu sekarang WIB, tanpa info zona (server Streamlit Cloud pakai UTC)."""
+    return datetime.now(WIB).replace(tzinfo=None)
+
+
+def today_wib():
+    return now_wib().date()
 
 # ================== KONFIGURASI ==================
 DB_PATH = "poin_toko.db"
@@ -22,6 +35,13 @@ try:
     SALES_PASSWORD = st.secrets["SALES_PASSWORD"]
 except Exception:
     SALES_PASSWORD = "sales123"  # GANTI sebelum dipakai!
+
+# Misi bonus: poin per jenis, bisa diklaim 1x per minggu (Senin-Minggu) per jenis
+MISI = {
+    "eceran": {"nama": "Sedia Eceran", "ikon": "🚬", "poin": 1000},
+    "sunblind": {"nama": "POSM Sunblind", "ikon": "⛱️", "poin": 1000},
+    "stiker": {"nama": "POSM Stiker", "ikon": "🏷️", "poin": 500},
+}
 
 STATUS_LABEL = {
     "pending": "⏳ Menunggu approval",
@@ -57,6 +77,20 @@ def get_conn():
             poin INTEGER NOT NULL,
             foto BLOB,
             sales TEXT,
+            dibuat TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS misi (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kode_toko TEXT NOT NULL REFERENCES toko(kode_toko),
+            jenis TEXT NOT NULL,
+            minggu TEXT NOT NULL,
+            foto BLOB,
+            keterangan TEXT,
+            poin INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            catatan TEXT,
+            diproses_oleh TEXT,
+            diproses_pada TEXT,
             dibuat TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS penukaran (
@@ -96,23 +130,47 @@ def query_df(sql, params=()):
 
 def saldo_toko(kode):
     conn = get_conn()
-    masuk = conn.execute(
+    beli = conn.execute(
         "SELECT COALESCE(SUM(poin),0) FROM transaksi "
+        "WHERE kode_toko=? AND status='approved'", (kode,)
+    ).fetchone()[0]
+    misi = conn.execute(
+        "SELECT COALESCE(SUM(poin),0) FROM misi "
         "WHERE kode_toko=? AND status='approved'", (kode,)
     ).fetchone()[0]
     keluar = conn.execute(
         "SELECT COALESCE(SUM(poin),0) FROM penukaran WHERE kode_toko=?", (kode,)
     ).fetchone()[0]
+    masuk = beli + misi
     return masuk, keluar, masuk - keluar
 
 
-def jumlah_pending(kode=None):
-    sql = "SELECT COUNT(*) FROM transaksi WHERE status='pending'"
+def jumlah_pending(kode=None, tabel="transaksi"):
+    sql = f"SELECT COUNT(*) FROM {tabel} WHERE status='pending'"
     params = ()
     if kode:
         sql += " AND kode_toko=?"
         params = (kode,)
     return get_conn().execute(sql, params).fetchone()[0]
+
+
+def minggu_ini():
+    """Kode minggu ISO (Senin-Minggu), mis. 2026-W43, plus tanggal Senin depan."""
+    hari = today_wib()
+    th, mg, _ = hari.isocalendar()
+    senin_depan = hari + timedelta(days=7 - hari.weekday())
+    return f"{th}-W{mg:02d}", senin_depan
+
+
+def status_misi_minggu_ini(kode, jenis):
+    """Status klaim misi minggu ini (None jika belum ada / hanya yang ditolak)."""
+    mg, _ = minggu_ini()
+    row = get_conn().execute(
+        "SELECT status FROM misi WHERE kode_toko=? AND jenis=? AND minggu=? "
+        "AND status IN ('pending','approved') ORDER BY id DESC LIMIT 1",
+        (kode, jenis, mg),
+    ).fetchone()
+    return row[0] if row else None
 
 
 def list_toko():
@@ -193,7 +251,72 @@ def lihat_foto_nota(trx, key, boleh_hapus=False):
 
 # ================== HALAMAN SALES ==================
 def sales_approval():
-    st.subheader("✅ Approval Nota dari Toko")
+    st.subheader("✅ Approval dari Toko")
+    n_nota, n_misi = jumlah_pending(), jumlah_pending(tabel="misi")
+    tab_nota, tab_misi = st.tabs([f"🧾 Nota Pembelian ({n_nota})",
+                                  f"🎯 Misi Bonus ({n_misi})"])
+    with tab_nota:
+        sales_approval_nota()
+    with tab_misi:
+        sales_approval_misi()
+
+
+def sales_approval_misi():
+    pend = query_df(
+        """SELECT m.id, m.kode_toko, t.nama_toko, m.jenis, m.minggu, m.keterangan,
+                  m.poin, m.dibuat
+           FROM misi m JOIN toko t USING(kode_toko)
+           WHERE m.status='pending' ORDER BY m.dibuat"""
+    )
+    if pend.empty:
+        st.success("Tidak ada misi yang menunggu approval.")
+        return
+    st.caption(f"{len(pend)} misi menunggu. Pastikan foto sesuai sebelum approve.")
+
+    for r in pend.itertuples():
+        info = MISI[r.jenis]
+        with st.container(border=True):
+            st.markdown(
+                f"**{info['ikon']} {info['nama']}** · {r.nama_toko} ({r.kode_toko}) · "
+                f"minggu {r.minggu} · diajukan {r.dibuat[:16].replace('T', ' ')}"
+            )
+            foto = get_conn().execute(
+                "SELECT foto FROM misi WHERE id=?", (r.id,)
+            ).fetchone()[0]
+            if foto:
+                st.image(foto, use_container_width=True)
+            if r.keterangan:
+                label = "Brand yang diecer" if r.jenis == "eceran" else "Keterangan"
+                st.write(f"**{label}:** {r.keterangan}")
+            st.write(f"**Poin:** {poin(r.poin)}")
+            catatan = st.text_input("Catatan / alasan ditolak", key=f"mct{r.id}").strip()
+
+            b1, b2 = st.columns(2)
+            if b1.button("✅ Approve", key=f"mok{r.id}", type="primary",
+                         use_container_width=True):
+                get_conn().execute(
+                    "UPDATE misi SET status='approved', catatan=?, diproses_oleh=?, "
+                    "diproses_pada=? WHERE id=?",
+                    (catatan or None, st.session_state.nama, now_wib().isoformat(), r.id),
+                )
+                get_conn().commit()
+                st.toast(f"Disetujui: {r.nama_toko} +{poin(r.poin)}")
+                st.rerun()
+            if b2.button("❌ Tolak", key=f"mno{r.id}", use_container_width=True):
+                if not catatan:
+                    st.error("Isi alasan penolakan dulu supaya toko tahu.")
+                else:
+                    get_conn().execute(
+                        "UPDATE misi SET status='rejected', catatan=?, diproses_oleh=?, "
+                        "diproses_pada=? WHERE id=?",
+                        (catatan, st.session_state.nama, now_wib().isoformat(), r.id),
+                    )
+                    get_conn().commit()
+                    st.toast(f"Ditolak: {r.nama_toko}")
+                    st.rerun()
+
+
+def sales_approval_nota():
     pend = query_df(
         """SELECT x.id, x.kode_toko, t.nama_toko, x.tanggal, x.jumlah_pack,
                   x.deskripsi, x.dibuat
@@ -234,7 +357,7 @@ def sales_approval():
                     sql = ("UPDATE transaksi SET status='approved', jumlah_pack=?, poin=?, "
                            "catatan=?, diproses_oleh=?, diproses_pada=?")
                     params = [int(pack), int(pack) * POIN_PER_PACK, catatan or None,
-                              st.session_state.nama, datetime.now().isoformat()]
+                              st.session_state.nama, now_wib().isoformat()]
                     if no_nota:
                         sql += ", no_nota=?"
                         params.append(no_nota)
@@ -253,7 +376,7 @@ def sales_approval():
                     get_conn().execute(
                         "UPDATE transaksi SET status='rejected', catatan=?, "
                         "diproses_oleh=?, diproses_pada=? WHERE id=?",
-                        (catatan, st.session_state.nama, datetime.now().isoformat(), r.id),
+                        (catatan, st.session_state.nama, now_wib().isoformat(), r.id),
                     )
                     get_conn().commit()
                     st.toast(f"Ditolak: {r.nama_toko}")
@@ -274,7 +397,7 @@ def sales_input_nota():
 
     col1, col2 = st.columns(2)
     no_nota = col1.text_input("No. Nota").strip().upper()
-    tgl = col2.date_input("Tanggal", value=date.today(), max_value=date.today())
+    tgl = col2.date_input("Tanggal", value=today_wib(), max_value=today_wib())
     jumlah = st.number_input(
         f"Jumlah pack (min {MIN_PACK}, max {MAX_PACK} = 1 slop)",
         min_value=MIN_PACK, max_value=MAX_PACK, value=1, step=1,
@@ -303,8 +426,8 @@ def sales_input_nota():
                     status,sumber,diproses_oleh,diproses_pada)
                    VALUES (?,?,?,?,?,?,?,?,'approved','sales',?,?)""",
                 (kode, no_nota, tgl.isoformat(), int(jumlah), dapat,
-                 foto.getvalue(), st.session_state.nama, datetime.now().isoformat(),
-                 st.session_state.nama, datetime.now().isoformat()),
+                 foto.getvalue(), st.session_state.nama, now_wib().isoformat(),
+                 st.session_state.nama, now_wib().isoformat()),
             )
             get_conn().commit()
             st.success(f"Tersimpan! {pilihan} mendapat {poin(dapat)}.")
@@ -330,7 +453,7 @@ def sales_daftar_toko():
                     get_conn().execute(
                         "INSERT INTO toko VALUES (?,?,?,?,?,?,?)",
                         (kode, nama, pemilik, hp, alamat, hash_pin(pin),
-                         datetime.now().isoformat()),
+                         now_wib().isoformat()),
                     )
                     get_conn().commit()
                     st.success(f"Toko {nama} terdaftar. Kode: {kode}")
@@ -367,18 +490,23 @@ def sales_rekap():
           COALESCE((SELECT SUM(jumlah_pack) FROM transaksi x
              WHERE x.kode_toko=t.kode_toko AND x.status='approved'),0) AS Pack,
           COALESCE((SELECT SUM(poin) FROM transaksi x
-             WHERE x.kode_toko=t.kode_toko AND x.status='approved'),0) AS PoinMasuk,
+             WHERE x.kode_toko=t.kode_toko AND x.status='approved'),0) AS PoinBeli,
+          COALESCE((SELECT SUM(poin) FROM misi m
+             WHERE m.kode_toko=t.kode_toko AND m.status='approved'),0) AS PoinMisi,
           COALESCE((SELECT SUM(poin) FROM penukaran p
              WHERE p.kode_toko=t.kode_toko),0) AS PoinDitukar,
           (SELECT COUNT(*) FROM transaksi x
-             WHERE x.kode_toko=t.kode_toko AND x.status='pending') AS Pending
-        FROM toko t ORDER BY PoinMasuk DESC
+             WHERE x.kode_toko=t.kode_toko AND x.status='pending')
+          + (SELECT COUNT(*) FROM misi m
+             WHERE m.kode_toko=t.kode_toko AND m.status='pending') AS Pending
+        FROM toko t
         """
     )
     if df.empty:
         st.info("Belum ada data.")
         return
-    df["SaldoPoin"] = df.PoinMasuk - df.PoinDitukar
+    df["SaldoPoin"] = df.PoinBeli + df.PoinMisi - df.PoinDitukar
+    df = df.sort_values("SaldoPoin", ascending=False)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Total Toko", len(df))
@@ -431,8 +559,8 @@ def sales_penukaran():
                 get_conn().execute(
                     "INSERT INTO penukaran (kode_toko,tanggal,poin,keterangan,dibuat) "
                     "VALUES (?,?,?,?,?)",
-                    (kode, date.today().isoformat(), int(jml), ket,
-                     datetime.now().isoformat()),
+                    (kode, today_wib().isoformat(), int(jml), ket,
+                     now_wib().isoformat()),
                 )
                 get_conn().commit()
                 st.success(f"Penukaran {poin(jml)} berhasil.")
@@ -450,9 +578,9 @@ def toko_saldo():
     c1.metric("Total poin terkumpul", poin(masuk))
     c2.metric("Sudah ditukar", poin(keluar))
 
-    n_pending = jumlah_pending(kode)
+    n_pending = jumlah_pending(kode) + jumlah_pending(kode, tabel="misi")
     if n_pending:
-        st.info(f"⏳ {n_pending} nota sedang menunggu approval sales.")
+        st.info(f"⏳ {n_pending} pengajuan sedang menunggu approval sales.")
 
     trx = query_df(
         "SELECT id, tanggal AS Tanggal, no_nota AS Nota, jumlah_pack AS Pack, "
@@ -479,6 +607,24 @@ def toko_saldo():
         st.dataframe(tampil.drop(columns="id"), hide_index=True,
                      use_container_width=True)
         lihat_foto_nota(trx, key="toko_foto")
+
+    misi = query_df(
+        "SELECT dibuat, jenis, keterangan, poin, status, catatan "
+        "FROM misi WHERE kode_toko=? ORDER BY dibuat DESC", (kode,)
+    )
+    if not misi.empty:
+        st.subheader("Riwayat Misi Bonus")
+        st.dataframe(
+            pd.DataFrame({
+                "Tanggal": misi.dibuat.str[:10],
+                "Misi": misi.jenis.map(lambda j: f"{MISI[j]['ikon']} {MISI[j]['nama']}"),
+                "Keterangan": misi.keterangan.fillna(""),
+                "Poin": misi.poin,
+                "Status": misi.status.map(STATUS_LABEL),
+                "Catatan": misi.catatan.fillna(""),
+            }),
+            hide_index=True, use_container_width=True,
+        )
 
     tukar = query_df(
         "SELECT tanggal AS Tanggal, poin AS Poin, keterangan AS Keterangan "
@@ -524,7 +670,7 @@ def toko_tambah_poin():
         if not pack:
             st.error("Isi total pembelian (pack).")
             return
-        now = datetime.now()
+        now = now_wib()
         get_conn().execute(
             """INSERT INTO transaksi
                (kode_toko,no_nota,tanggal,jumlah_pack,poin,foto,dibuat,
@@ -540,6 +686,84 @@ def toko_tambah_poin():
         st.rerun()
 
 
+def kartu_misi(kode, jenis, minta_brand=False):
+    """Satu kartu misi: foto kamera (+ brand), kirim ke sales, 1x per minggu."""
+    info = MISI[jenis]
+    _, senin_depan = minggu_ini()
+    with st.container(border=True):
+        st.markdown(f"### {info['ikon']} {info['nama']} · +{poin(info['poin'])}")
+        status = status_misi_minggu_ini(kode, jenis)
+        if status == "pending":
+            st.info("⏳ Sudah dikirim minggu ini, menunggu konfirmasi sales.")
+            return
+        if status == "approved":
+            st.success(
+                f"✅ Poin minggu ini sudah didapat. Misi dibuka lagi Senin, "
+                f"{senin_depan:%d-%m-%Y}."
+            )
+            return
+
+        v = st.session_state.setdefault(f"misi_ver_{jenis}", 0)
+        if minta_brand:
+            st.caption("Foto rak/etalase rokok eceran Anda, lalu tulis brand yang diecer.")
+        else:
+            st.caption(f"Foto {info['nama'].replace('POSM ', '').lower()} kami yang "
+                       "terpasang di toko Anda.")
+        foto = st.camera_input(f"📷 Foto {info['nama']}", key=f"mcam_{jenis}{v}")
+        brand = ""
+        if minta_brand:
+            brand = st.text_input(
+                "Brand rokok yang diecer",
+                placeholder="mis. Surya 12, Gudang Garam Filter, Sampoerna Mild",
+                key=f"mbrand_{jenis}{v}",
+            ).strip()
+
+        if st.button(f"📤 Kirim {info['nama']}", key=f"mkirim_{jenis}{v}",
+                     type="primary", use_container_width=True):
+            if foto is None:
+                st.error("Ambil foto dulu dengan kamera.")
+                return
+            if minta_brand and not brand:
+                st.error("Tulis brand rokok yang diecer.")
+                return
+            # cek ulang supaya tidak dobel klik
+            if status_misi_minggu_ini(kode, jenis):
+                st.rerun()
+            mg, _ = minggu_ini()
+            get_conn().execute(
+                "INSERT INTO misi (kode_toko,jenis,minggu,foto,keterangan,poin,status,dibuat) "
+                "VALUES (?,?,?,?,?,?,'pending',?)",
+                (kode, jenis, mg, foto.getvalue(), brand or None, info["poin"],
+                 now_wib().isoformat()),
+            )
+            get_conn().commit()
+            st.session_state[f"misi_ver_{jenis}"] = v + 1
+            st.toast(f"{info['nama']} terkirim! Tunggu konfirmasi sales.")
+            st.rerun()
+
+
+def toko_misi():
+    kode = st.session_state.kode_toko
+    st.subheader("🎯 Misi Bonus Poin")
+    st.info(
+        "**Jangan khawatir!** Jika mau tambahan poin, Bapak/Ibu cukup sediakan "
+        "**Eceran** dan **POSM** kami. 🙏"
+    )
+    _, senin_depan = minggu_ini()
+    st.caption(
+        f"Setiap misi bisa diklaim 1x per minggu (Senin–Minggu) dan poin masuk setelah "
+        f"dikonfirmasi sales. Minggu baru mulai Senin, {senin_depan:%d-%m-%Y}."
+    )
+
+    st.markdown("## 🚬 Sedia Eceran")
+    kartu_misi(kode, "eceran", minta_brand=True)
+
+    st.markdown("## 📌 Misi POSM")
+    st.caption("Pasang POSM kami lalu foto. Sunblind dan stiker bisa diklaim dua-duanya.")
+    kartu_misi(kode, "sunblind")
+    kartu_misi(kode, "stiker")
+
+
 # ================== ROUTER ==================
 def main():
     role = st.session_state.get("role")
@@ -548,18 +772,19 @@ def main():
         return
     tombol_keluar()
     if role == "toko":
-        menu = st.sidebar.radio("Menu", ["Saldo Poin", "Tambah Poin"])
-        {"Saldo Poin": toko_saldo, "Tambah Poin": toko_tambah_poin}[menu]()
+        menu = st.sidebar.radio("Menu", ["Saldo Poin", "Tambah Poin", "Misi Bonus"])
+        {"Saldo Poin": toko_saldo, "Tambah Poin": toko_tambah_poin,
+         "Misi Bonus": toko_misi}[menu]()
     else:
-        n = jumlah_pending()
+        n = jumlah_pending() + jumlah_pending(tabel="misi")
         if n:
-            st.sidebar.warning(f"🔔 {n} nota toko menunggu approval")
+            st.sidebar.warning(f"🔔 {n} pengajuan toko menunggu approval")
         menu = st.sidebar.radio(
             "Menu",
-            ["Approval Nota", "Input Nota", "Rekap Poin", "Penukaran Poin", "Daftar Toko"],
+            ["Approval", "Input Nota", "Rekap Poin", "Penukaran Poin", "Daftar Toko"],
         )
         {
-            "Approval Nota": sales_approval,
+            "Approval": sales_approval,
             "Input Nota": sales_input_nota,
             "Rekap Poin": sales_rekap,
             "Penukaran Poin": sales_penukaran,
