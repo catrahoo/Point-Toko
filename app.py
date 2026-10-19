@@ -616,7 +616,7 @@ def halaman_login():
     st.markdown(
         f"""<div class="logo-wrap">
               <div class="logo"><b>POIN</b><i>toko</i></div>
-              <div class="logo-sub">Setiap 1 pack = {POIN_PER_PACK} poin 🎁</div>
+              <div class="logo-sub">Ayo Belanja Dan Kumpulkan Poinnya! = {POIN_PER_PACK} poin 🎁</div>
             </div>""",
         unsafe_allow_html=True,
     )
