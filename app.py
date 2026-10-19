@@ -83,17 +83,23 @@ GEMINI_MODEL = secret("GEMINI_MODEL", "gemini-2.0-flash")
 # Foto disimpan ke Drive pribadi lewat Apps Script (lihat FotoAPI.gs)
 FOTO_SCRIPT_URL = str(secret("FOTO_SCRIPT_URL", "") or "").strip()
 FOTO_TOKEN = str(secret("FOTO_TOKEN", "") or "").strip()
-FOTO_MAKS_UMUR_MENIT = 15  # foto cadangan (upload) harus diambil maks 15 menit lalu
 # Master customer (sama dengan app Cek Koordinat), hanya dibaca
 CUSTOMER_SHEET_ID = _ambil_sheet_id(
     secret("CUSTOMER_SHEET_ID", "113E5fKvZ0wWloSbQ9IQo8QiCOz5C3zlJr28012PbXz4"))
 
-# Misi bonus: poin per jenis, bisa diklaim 1x per minggu (Senin-Minggu) per jenis
-MISI = {
-    "eceran":   {"nama": "Sedia Eceran",  "ikon": "🚬",  "poin": 1000},
-    "sunblind": {"nama": "POSM Sunblind", "ikon": "⛱️", "poin": 1000},
-    "stiker":   {"nama": "POSM Stiker",   "ikon": "🏷️", "poin": 500},
-}
+# Program poin: diatur di menu Sales > Atur Program (disimpan di sheet "Program").
+# Daftar ini hanya isi awal saat sheet Program masih kosong.
+PROGRAM_DEFAULT = [
+    {"kode": "pembelian", "nama": "Pembelian Nota", "ikon": "🧾", "jenis": "pembelian",
+     "poin": 100, "aktif": "ya", "deskripsi": "Poin per pack dari nota pembelian ke sales"},
+    {"kode": "eceran", "nama": "Sedia Eceran", "ikon": "🚬", "jenis": "misi", "poin": 1000,
+     "aktif": "ya", "keterangan": "Brand rokok yang diecer",
+     "deskripsi": "Foto rak/etalase rokok eceran Anda"},
+    {"kode": "sunblind", "nama": "POSM Sunblind", "ikon": "⛱️", "jenis": "misi", "poin": 1000,
+     "aktif": "ya", "deskripsi": "Foto sunblind kami yang terpasang di toko Anda"},
+    {"kode": "stiker", "nama": "POSM Stiker", "ikon": "🏷️", "jenis": "misi", "poin": 500,
+     "aktif": "ya", "deskripsi": "Foto stiker kami yang terpasang di toko Anda"},
+]
 
 STATUS_LABEL = {
     "pending":  "⏳ Menunggu approval",
@@ -113,6 +119,8 @@ COLS = {
              "catatan", "diproses_oleh", "diproses_pada", "dibuat", "foto_id", "foto_link",
              "foto_mode", "foto_hash"],
     "Penukaran": ["id", "kode_toko", "nama_toko", "tanggal", "poin", "keterangan", "dibuat"],
+    "Program": ["kode", "nama", "ikon", "jenis", "poin", "aktif", "mulai", "selesai",
+                "keterangan", "deskripsi", "diubah_oleh", "diubah_pada"],
 }
 KOLOM_ANGKA = {"jumlah_pack", "poin", "ai_pack"}
 
@@ -642,29 +650,6 @@ def _browser_dalam_app():
     return any(k in ua for k in _BROWSER_DALAM_APP)
 
 
-def _waktu_exif(raw):
-    """Waktu pengambilan foto dari data EXIF kamera, atau None."""
-    try:
-        exif = Image.open(io.BytesIO(raw)).getexif()
-        val = None
-        try:
-            val = exif.get_ifd(0x8769).get(36867)  # DateTimeOriginal
-        except Exception:
-            pass
-        val = val or exif.get(306)  # DateTime
-        if not val:
-            return None
-        return datetime.strptime(str(val).strip()[:19], "%Y:%m:%d %H:%M:%S")
-    except Exception:
-        return None
-
-
-def _foto_masih_baru(t_foto):
-    """Maks FOTO_MAKS_UMUR_MENIT lalu. Toleransi jam HP WIB/WITA/WIT & selisih 5 menit."""
-    selisih = (now_wib() - t_foto).total_seconds() / 60
-    return any(-5 <= selisih + off <= FOTO_MAKS_UMUR_MENIT for off in (0, 60, 120))
-
-
 def foto_sudah_dipakai(h):
     return bool(h) and any((tabel(n).foto_hash == h).any() for n in ("Transaksi", "Misi"))
 
@@ -677,47 +662,123 @@ def panduan_kamera():
             "**Kamera** → **Izinkan**, lalu muat ulang halaman.\n"
             "3. Buka link di **Google Chrome** (Android) atau **Safari** (iPhone), jangan dari "
             "dalam WhatsApp / Instagram / Facebook.\n"
-            "4. Tutup aplikasi lain yang sedang memakai kamera, lalu muat ulang.\n"
-            "5. Masih gagal? Pilih **📱 Kamera HP (cadangan)** di atas."
+            "4. Tutup aplikasi lain yang sedang memakai kamera, lalu muat ulang."
         )
 
 
 def ambil_foto_langsung(key, label):
-    """Foto real-time. Return dict {bytes, mode, hash} atau None.
-    Kamera langsung (utama) atau kamera HP (cadangan, dicek waktu EXIF)."""
+    """Foto real-time lewat kamera langsung. Return dict {bytes, mode, hash} atau None."""
     if _browser_dalam_app():
         st.warning("⚠️ Anda membuka aplikasi dari dalam WhatsApp/Instagram/Facebook. Kamera "
                    "sering tidak bisa dibuka di sini. Ketuk ⋮ lalu pilih **Buka di Chrome / "
                    "Open in browser**.")
-    cara = st.radio("Cara foto", ["📷 Kamera langsung", "📱 Kamera HP (cadangan)"],
-                    horizontal=True, key=f"{key}_cara")
-    if cara.startswith("📷"):
-        f = st.camera_input(label, key=f"{key}_cam")
-        panduan_kamera()
-        if f is None:
-            return None
-        raw = f.getvalue()
-        return {"bytes": raw, "mode": "kamera langsung", "hash": hashlib.md5(raw).hexdigest()}
-
-    st.caption(f"Ketuk tombol di bawah → pilih **Kamera** → foto sekarang juga. Foto dari "
-               f"galeri, screenshot, atau kiriman WhatsApp akan ditolak (maks "
-               f"{FOTO_MAKS_UMUR_MENIT} menit sejak foto diambil).")
-    f = st.file_uploader(label, type=["jpg", "jpeg"], key=f"{key}_up")
+    f = st.camera_input(label, key=f"{key}_cam")
+    panduan_kamera()
     if f is None:
         return None
     raw = f.getvalue()
-    t = _waktu_exif(raw)
-    if t is None:
-        st.error("❌ Foto ini tidak punya data waktu pengambilan (biasanya screenshot, hasil "
-                 "edit, atau kiriman WhatsApp). Ambil foto baru langsung dengan kamera.")
-        return None
-    if not _foto_masih_baru(t):
-        st.error(f"❌ Foto ini diambil {t:%d-%m-%Y %H:%M}. Foto harus baru diambil (maks "
-                 f"{FOTO_MAKS_UMUR_MENIT} menit). Silakan foto ulang sekarang.")
-        return None
-    st.image(raw, use_container_width=True)
-    return {"bytes": raw, "mode": f"kamera HP {t:%d-%m-%Y %H:%M}",
-            "hash": hashlib.md5(raw).hexdigest()}
+    return {"bytes": raw, "mode": "kamera langsung", "hash": hashlib.md5(raw).hexdigest()}
+
+
+# ================== PROGRAM POIN ==================
+def program_df():
+    """Semua program dari sheet Program (diisi default kalau masih kosong)."""
+    df = tabel("Program")
+    if df.empty:
+        ws = _ws_ensure("Program")
+        ws.append_rows([[r.get(c, "") for c in COLS["Program"]] for r in PROGRAM_DEFAULT],
+                       value_input_option="RAW")
+        segarkan()
+        df = tabel("Program")
+    df = df[df.kode.str.strip() != ""].drop_duplicates("kode").copy()
+    df["aktif"] = df.aktif.str.strip().str.lower()
+    return df.reset_index(drop=True)
+
+
+def _status_program(r):
+    hari = today_wib().isoformat()
+    if r["aktif"] != "ya":
+        return "⏸️ Nonaktif"
+    if r["mulai"] and hari < r["mulai"][:10]:
+        return "🕒 Belum mulai"
+    if r["selesai"] and hari > r["selesai"][:10]:
+        return "⛔ Berakhir"
+    return "🟢 Berjalan"
+
+
+def program_berjalan(kode):
+    df = program_df()
+    r = df[df.kode == kode]
+    return None if r.empty or _status_program(r.iloc[0]) != "🟢 Berjalan" else r.iloc[0].to_dict()
+
+
+def misi_berjalan():
+    df = program_df()
+    return [r.to_dict() for _, r in df[df.jenis == "misi"].iterrows()
+            if _status_program(r) == "🟢 Berjalan"]
+
+
+def poin_per_pack():
+    df = program_df()
+    r = df[df.kode == "pembelian"]
+    return int(r.poin.iloc[0]) if len(r) and r.poin.iloc[0] > 0 else POIN_PER_PACK
+
+
+def label_misi(kode):
+    df = program_df()
+    r = df[df.kode == kode]
+    return f"{r.ikon.iloc[0]} {r.nama.iloc[0]}" if len(r) else f"🎯 {kode}"
+
+
+def tgl_id(iso):
+    try:
+        return datetime.fromisoformat(str(iso)[:10]).strftime("%d-%m-%Y")
+    except ValueError:
+        return ""
+
+
+def papan_peringkat():
+    """Peringkat semua toko berdasarkan total poin terkumpul sepanjang waktu."""
+    toko = tabel("Toko")[["kode_toko", "nama_toko"]].copy()
+    t, m = tabel("Transaksi"), tabel("Misi")
+    total = pd.concat([t[t.status == "approved"][["kode_toko", "poin"]],
+                       m[m.status == "approved"][["kode_toko", "poin"]]])
+    toko["total"] = toko.kode_toko.map(total.groupby("kode_toko").poin.sum()).fillna(0).astype(int)
+    toko = toko.sort_values("total", ascending=False).reset_index(drop=True)
+    toko["peringkat"] = toko.total.rank(method="min", ascending=False).astype(int)
+    return toko
+
+
+def tampil_leaderboard(kode_saya):
+    st.markdown("### 🏆 Papan Juara Poin")
+    lb = papan_peringkat()
+    juara = lb[lb.total > 0].head(3)
+    if juara.empty:
+        st.info("Belum ada juara. Kumpulkan poin dan jadilah toko pertama di puncak! 💪")
+        return
+    medali = ["🥇", "🥈", "🥉"]
+    kolom = st.columns(3)
+    for i, r in enumerate(juara.itertuples()):
+        saya = " (Anda)" if r.kode_toko == kode_saya else ""
+        kolom[i].markdown(
+            f"""<div style="text-align:center;border:1.5px solid rgba(255,255,255,.7);
+            border-radius:18px;padding:14px 6px;background:linear-gradient(180deg,
+            rgba(74,155,240,.45),rgba(13,47,134,.6));">
+            <div style="font-size:2.4rem;line-height:1">{medali[i]}</div>
+            <div style="font-weight:900;margin-top:6px">{r.nama_toko}{saya}</div>
+            <div style="color:#dbe9ff">{poin(r.total)}</div></div>""",
+            unsafe_allow_html=True)
+    me = lb[lb.kode_toko == kode_saya]
+    if me.empty:
+        return
+    rank, total = int(me.peringkat.iloc[0]), int(me.total.iloc[0])
+    if total > 0 and rank <= 3:
+        st.success(f"🎉 Toko Anda di peringkat **{rank}**! Pertahankan posisi Anda!")
+    else:
+        batas = int(juara.total.iloc[-1]) if len(juara) == 3 else 0
+        kurang = max(batas - total + 1, 1)
+        st.info(f"Toko Anda di peringkat **{rank}** dari {len(lb)} toko. Kurang "
+                f"**{poin(kurang)}** lagi untuk masuk Top 3! 🚀")
 
 
 # ================== HELPER ==================
@@ -786,7 +847,7 @@ def halaman_login():
     st.markdown(
         f"""<div class="logo-wrap">
               <div class="logo"><b>POIN</b><i>toko</i></div>
-              <div class="logo-sub">Setiap 1 pack = {POIN_PER_PACK} poin 🎁</div>
+              <div class="logo-sub">Kumpulkan poin & jadi juara toko 🏆</div>
             </div>""",
         unsafe_allow_html=True,
     )
@@ -878,15 +939,14 @@ def sales_approval_nota():
         with st.container(border=True):
             st.markdown(f"**{r.nama_toko}** ({r.kode_toko}) · diajukan {waktu(r.dibuat)}")
             tampil_foto(r.foto_id)
-            if str(r.foto_mode).startswith("kamera HP"):
-                st.info(f"📱 Foto lewat jalur cadangan ({r.foto_mode}). Cek foto lebih teliti.")
             st.write(f"**Deskripsi dari toko:** {r.deskripsi or '-'}")
             if r.ai_baca:
                 st.write(f"**🤖 Bacaan AI saat foto diambil:** {r.ai_baca}")
                 if r.ai_pack and r.ai_pack != r.jumlah_pack:
                     st.warning(f"⚠️ Toko mengajukan {r.jumlah_pack} pack, tapi AI membaca "
                                f"{r.ai_pack} pack di nota. Cek foto dengan teliti.")
-            st.write(f"**Diajukan:** {r.jumlah_pack} pack = {poin(r.jumlah_pack * POIN_PER_PACK)}")
+            tarif = (r.poin // r.jumlah_pack) if r.jumlah_pack else poin_per_pack()
+            st.write(f"**Diajukan:** {r.jumlah_pack} pack × {tarif} = {poin(r.poin)}")
 
             c1, c2 = st.columns(2)
             pack = c1.number_input(
@@ -905,13 +965,13 @@ def sales_approval_nota():
                     st.error(f"No. nota {no_nota} sudah pernah dipakai. Kemungkinan nota dobel.")
                 else:
                     fields = {"status": "approved", "jumlah_pack": int(pack),
-                              "poin": int(pack) * POIN_PER_PACK, "catatan": catatan,
+                              "poin": int(pack) * tarif, "catatan": catatan,
                               "diproses_oleh": st.session_state.nama,
                               "diproses_pada": now_wib().isoformat(timespec="seconds")}
                     if no_nota:
                         fields["no_nota"] = no_nota
                     ubah("Transaksi", "id", r.id, fields)
-                    st.toast(f"Disetujui: {r.nama_toko} +{poin(int(pack) * POIN_PER_PACK)}")
+                    st.toast(f"Disetujui: {r.nama_toko} +{poin(int(pack) * tarif)}")
                     st.rerun()
             if b2.button("❌ Tolak", key=f"no{r.id}", use_container_width=True):
                 if not catatan:
@@ -934,15 +994,13 @@ def sales_approval_misi():
     st.caption(f"{len(pend)} misi menunggu. Pastikan foto sesuai sebelum approve.")
 
     for r in pend.itertuples():
-        info = MISI.get(r.jenis, {"nama": r.jenis, "ikon": "🎯"})
+        info = dict(zip(("ikon", "nama"), label_misi(r.jenis).split(" ", 1)))
         with st.container(border=True):
             st.markdown(
                 f"**{info['ikon']} {info['nama']}** · {r.nama_toko} ({r.kode_toko}) · "
                 f"minggu {r.minggu} · diajukan {waktu(r.dibuat)}"
             )
             tampil_foto(r.foto_id)
-            if str(r.foto_mode).startswith("kamera HP"):
-                st.info(f"📱 Foto lewat jalur cadangan ({r.foto_mode}). Cek foto lebih teliti.")
             if r.keterangan:
                 label = "Brand yang diecer" if r.jenis == "eceran" else "Keterangan"
                 st.write(f"**{label}:** {r.keterangan}")
@@ -989,7 +1047,7 @@ def sales_input_nota():
         f"Jumlah pack (min {MIN_PACK}, max {MAX_PACK} = 1 slop)",
         min_value=MIN_PACK, max_value=MAX_PACK, value=1, step=1,
     )
-    dapat = int(jumlah) * POIN_PER_PACK
+    dapat = int(jumlah) * poin_per_pack()
     st.metric("Poin yang didapat", poin(dapat))
 
     sumber = st.radio("Foto nota", ["Kamera", "Upload file"], horizontal=True)
@@ -1188,6 +1246,9 @@ def toko_saldo():
     c1.metric("Total poin terkumpul", poin(masuk))
     c2.metric("Sudah ditukar", poin(keluar))
 
+    st.divider()
+    tampil_leaderboard(kode)
+
     n_pending = jumlah_pending(kode) + jumlah_pending(kode, sheet="Misi")
     if n_pending:
         st.info(f"⏳ {n_pending} pengajuan sedang menunggu approval sales.")
@@ -1225,7 +1286,7 @@ def toko_saldo():
             pd.DataFrame({
                 "Tanggal": misi.dibuat.str[:10],
                 "Misi": misi.jenis.map(
-                    lambda j: f"{MISI[j]['ikon']} {MISI[j]['nama']}" if j in MISI else j),
+                    label_misi),
                 "Keterangan": misi.keterangan,
                 "Poin": misi.poin,
                 "Status": misi.status.map(STATUS_LABEL),
@@ -1248,9 +1309,15 @@ def toko_saldo():
 def toko_tambah_poin():
     kode = st.session_state.kode_toko
     st.subheader("➕ Tambahkan Poin dari Pembelian ke Sales")
+    prog = program_berjalan("pembelian")
+    if not prog:
+        st.info("Program poin pembelian sedang tidak berjalan. Pantau terus info dari sales kami ya! 🙏")
+        return
+    pp = int(prog["poin"])
+    sampai = f" · berlaku s/d {tgl_id(prog['selesai'])}" if prog["selesai"] else ""
     st.caption(
-        f"1 pack = {POIN_PER_PACK} poin · min {MIN_PACK} pack, max {MAX_PACK} pack (1 slop) per nota. "
-        "Poin masuk setelah disetujui sales."
+        f"1 pack = {pp} poin · min {MIN_PACK} pack, max {MAX_PACK} pack (1 slop) per nota"
+        f"{sampai}. Poin masuk setelah disetujui sales."
     )
 
     if st.session_state.pop("toko_kirim_ok", None):
@@ -1302,7 +1369,7 @@ def toko_tambah_poin():
         placeholder=f"Isi angka {MIN_PACK}-{MAX_PACK}", key=f"pack{v}", **awal,
     )
     if pack:
-        st.metric("Poin yang akan didapat", poin(int(pack) * POIN_PER_PACK))
+        st.metric("Poin yang akan didapat", poin(int(pack) * pp))
     desk = st.text_area(
         "Deskripsi (opsional)",
         placeholder="Tulis keterangan jika tulisan di nota kurang jelas, "
@@ -1325,7 +1392,7 @@ def toko_tambah_poin():
         tambah("Transaksi", {
             "kode_toko": kode, "nama_toko": st.session_state.nama, "no_nota": "",
             "tanggal": now.date().isoformat(), "jumlah_pack": int(pack),
-            "poin": int(pack) * POIN_PER_PACK, "status": "pending", "sumber": "toko",
+            "poin": int(pack) * pp, "status": "pending", "sumber": "toko",
             "deskripsi": desk.strip(), "dibuat": now.isoformat(timespec="seconds"),
             "ai_pack": hasil_ai["total_pack"] if hasil_ai else "",
             "ai_baca": ringkas_ai(hasil_ai) if hasil_ai else "",
@@ -1336,48 +1403,51 @@ def toko_tambah_poin():
         st.rerun()
 
 
-def kartu_misi(kode, jenis, minta_brand=False):
-    """Satu kartu misi: foto kamera (+ brand), kirim ke sales, 1x per minggu."""
-    info = MISI[jenis]
+def kartu_misi(kode, prog):
+    """Satu kartu misi. Kamera hanya dibuka untuk 1 misi sekaligus."""
+    jenis = prog["kode"]
     _, senin_depan = minggu_ini()
     with st.container(border=True):
-        st.markdown(f"### {info['ikon']} {info['nama']} · +{poin(info['poin'])}")
+        st.markdown(f"### {prog['ikon']} {prog['nama']} · +{poin(prog['poin'])}")
+        if prog["deskripsi"]:
+            st.caption(prog["deskripsi"] + (f" · berlaku s/d {tgl_id(prog['selesai'])}"
+                                            if prog["selesai"] else ""))
         status = status_misi_minggu_ini(kode, jenis)
         if status == "pending":
             st.info("⏳ Sudah dikirim minggu ini, menunggu konfirmasi sales.")
             return
         if status == "approved":
-            st.success(
-                f"✅ Poin minggu ini sudah didapat. Misi dibuka lagi Senin, "
-                f"{senin_depan:%d-%m-%Y}."
-            )
+            st.success(f"✅ Poin minggu ini sudah didapat. Dibuka lagi Senin, "
+                       f"{senin_depan:%d-%m-%Y}.")
+            return
+
+        if st.session_state.get("misi_buka") != jenis:
+            if st.button("📷 Ambil foto", key=f"buka_{jenis}", use_container_width=True):
+                st.session_state.misi_buka = jenis
+                st.rerun()
             return
 
         v = st.session_state.setdefault(f"misi_ver_{jenis}", 0)
-        if minta_brand:
-            st.caption("Foto rak/etalase rokok eceran Anda, lalu tulis brand yang diecer.")
-        else:
-            st.caption(f"Foto {info['nama'].replace('POSM ', '').lower()} kami yang "
-                       "terpasang di toko Anda.")
-        foto = ambil_foto_langsung(f"misi_{jenis}{v}", f"📷 Foto {info['nama']}")
-        brand = ""
-        if minta_brand:
-            brand = st.text_input(
-                "Brand rokok yang diecer",
-                placeholder="mis. ALVA, Wismilak Slim Klik, Diplomat EVO, dsb.",
-                key=f"mbrand_{jenis}{v}",
-            ).strip()
+        foto = ambil_foto_langsung(f"misi_{jenis}{v}", f"📷 Foto {prog['nama']}")
+        ket = ""
+        if prog["keterangan"]:
+            ket = st.text_input(f"{prog['keterangan']} *", key=f"mket_{jenis}{v}").strip()
 
-        if st.button(f"📤 Kirim {info['nama']}", key=f"mkirim_{jenis}{v}",
-                     type="primary", use_container_width=True):
+        b1, b2 = st.columns(2)
+        if b2.button("✖ Batal", key=f"batal_{jenis}", use_container_width=True):
+            st.session_state.pop("misi_buka", None)
+            st.rerun()
+        if b1.button("📤 Kirim", key=f"mkirim_{jenis}{v}", type="primary",
+                     use_container_width=True):
             if foto is None:
                 st.error("Ambil foto dulu dengan kamera.")
                 return
-            if minta_brand and not brand:
-                st.error("Tulis brand rokok yang diecer.")
+            if prog["keterangan"] and not ket:
+                st.error(f"Isi {prog['keterangan'].lower()}.")
                 return
             segarkan()
-            if status_misi_minggu_ini(kode, jenis):
+            if status_misi_minggu_ini(kode, jenis) or not program_berjalan(jenis):
+                st.session_state.pop("misi_buka", None)
                 st.rerun()
             if foto_sudah_dipakai(foto["hash"]):
                 st.error("❌ Foto ini sudah pernah dikirim sebelumnya. Ambil foto baru.")
@@ -1386,12 +1456,13 @@ def kartu_misi(kode, jenis, minta_brand=False):
             now = now_wib()
             tambah("Misi", {
                 "kode_toko": kode, "nama_toko": st.session_state.nama, "jenis": jenis,
-                "minggu": mg, "keterangan": brand, "poin": info["poin"],
+                "minggu": mg, "keterangan": ket, "poin": int(prog["poin"]),
                 "status": "pending", "dibuat": now.isoformat(timespec="seconds"),
                 "foto_mode": foto["mode"], "foto_hash": foto["hash"],
             }, foto=foto["bytes"], nama_foto=f"{kode}_{jenis}_{now:%Y%m%d_%H%M%S}")
             st.session_state[f"misi_ver_{jenis}"] = v + 1
-            st.toast(f"{info['nama']} terkirim! Tunggu konfirmasi sales.")
+            st.session_state.pop("misi_buka", None)
+            st.toast(f"{prog['nama']} terkirim! Tunggu konfirmasi sales.")
             st.rerun()
 
 
@@ -1407,28 +1478,113 @@ def toko_misi():
         f"Setiap misi bisa diklaim 1x per minggu (Senin–Minggu) dan poin masuk setelah "
         f"dikonfirmasi sales. Minggu baru mulai Senin, {senin_depan:%d-%m-%Y}."
     )
-
-    # Ringkasan status semua misi minggu ini
-    label_status = {"approved": "✅ Selesai", "pending": "⏳ Menunggu sales", None: "🔓 Tersedia"}
-    status = {j: status_misi_minggu_ini(kode, j) for j in MISI}
-    for j, info in MISI.items():
-        st.markdown(f"{info['ikon']} **{info['nama']}** (+{poin(info['poin'])}) · "
-                    f"{label_status[status[j]]}")
-
-    tersedia = [j for j in MISI if status[j] is None]
-    if not tersedia:
-        st.success(f"🎉 Semua misi minggu ini sudah dikirim. Misi dibuka lagi Senin, "
-                   f"{senin_depan:%d-%m-%Y}.")
+    daftar = misi_berjalan()
+    if not daftar:
+        st.info("Belum ada misi yang berjalan saat ini. Pantau terus ya! 🙏")
         return
+    if st.session_state.get("misi_buka") not in {p["kode"] for p in daftar}:
+        st.session_state.pop("misi_buka", None)
+    for prog in daftar:
+        kartu_misi(kode, prog)
 
-    st.markdown("### Kerjakan misi")
-    st.caption("Sunblind dan stiker bisa diklaim dua-duanya, satu per satu.")
-    # hanya 1 kamera aktif sekaligus supaya kamera HP tidak bentrok
-    if st.session_state.get("misi_pilih") not in tersedia:
-        st.session_state.pop("misi_pilih", None)
-    j = st.radio("Pilih misi", tersedia, horizontal=True, key="misi_pilih",
-                 format_func=lambda x: f"{MISI[x]['ikon']} {MISI[x]['nama']}")
-    kartu_misi(kode, j, minta_brand=(j == "eceran"))
+
+# ================== ADMIN: ATUR PROGRAM ==================
+def sales_program():
+    st.subheader("⚙️ Atur Program Poin")
+    st.caption("Ubah langsung di tabel lalu klik **Simpan**. Tanggal kosong = tanpa batas. "
+               "Perubahan poin hanya berlaku untuk pengajuan baru; poin yang sudah "
+               "tercatat tidak berubah.")
+    df = program_df()
+    tabel_edit = pd.DataFrame({
+        "kode": df.kode,
+        "Ikon": df.ikon,
+        "Nama": df.nama,
+        "Jenis": df.jenis.map({"pembelian": "Pembelian (poin/pack)",
+                               "misi": "Misi foto (poin/klaim)"}).fillna(df.jenis),
+        "Poin": df.poin,
+        "Aktif": df.aktif.eq("ya"),
+        "Mulai": pd.to_datetime(df.mulai.str[:10], errors="coerce"),
+        "Selesai": pd.to_datetime(df.selesai.str[:10], errors="coerce"),
+        "Isian wajib": df.keterangan,
+        "Petunjuk foto": df.deskripsi,
+        "Status": [_status_program(r) for _, r in df.iterrows()],
+    })
+    hasil = st.data_editor(
+        tabel_edit, hide_index=True, use_container_width=True, num_rows="fixed",
+        key="prog_editor", disabled=["Jenis", "Status"],
+        column_config={
+            "kode": None,
+            "Poin": st.column_config.NumberColumn(min_value=1, step=50, required=True),
+            "Aktif": st.column_config.CheckboxColumn(),
+            "Mulai": st.column_config.DateColumn(format="DD-MM-YYYY"),
+            "Selesai": st.column_config.DateColumn(format="DD-MM-YYYY"),
+            "Isian wajib": st.column_config.TextColumn(
+                help="Kosongkan jika toko cukup kirim foto. Isi label (mis. 'Brand rokok "
+                     "yang diecer') jika toko wajib mengetik keterangan."),
+        },
+    )
+    if st.button("💾 Simpan Program", type="primary", use_container_width=True):
+        def iso(x):
+            return "" if pd.isna(x) else pd.Timestamp(x).date().isoformat()
+        rows, salah = [], []
+        now = now_wib().isoformat(timespec="seconds")
+        for (_, asal), (_, baru) in zip(df.iterrows(), hasil.iterrows()):
+            mulai, selesai = iso(baru["Mulai"]), iso(baru["Selesai"])
+            if mulai and selesai and mulai > selesai:
+                salah.append(baru["Nama"])
+            berubah = (int(baru["Poin"]) != int(asal["poin"]) or baru["Aktif"] != (asal["aktif"] == "ya")
+                       or mulai != asal["mulai"][:10] or selesai != asal["selesai"][:10]
+                       or baru["Nama"] != asal["nama"] or baru["Ikon"] != asal["ikon"]
+                       or baru["Isian wajib"] != asal["keterangan"]
+                       or baru["Petunjuk foto"] != asal["deskripsi"])
+            rows.append([asal["kode"], str(baru["Nama"]).strip(), str(baru["Ikon"]).strip(),
+                         asal["jenis"], int(baru["Poin"]), "ya" if baru["Aktif"] else "tidak",
+                         mulai, selesai, str(baru["Isian wajib"] or "").strip(),
+                         str(baru["Petunjuk foto"] or "").strip(),
+                         st.session_state.nama if berubah else asal["diubah_oleh"],
+                         now if berubah else asal["diubah_pada"]])
+        if salah:
+            st.error("Tanggal mulai lebih besar dari tanggal selesai: " + ", ".join(salah))
+        else:
+            with st.spinner("Menyimpan..."):
+                ws = _ws_ensure("Program")
+                ws.clear()
+                ws.update([COLS["Program"]] + rows, "A1", value_input_option="RAW")
+            segarkan()
+            st.success("✅ Program tersimpan.")
+            st.rerun()
+
+    with st.expander("➕ Tambah misi foto baru"):
+        with st.form("form_misi_baru", clear_on_submit=True):
+            nama = st.text_input("Nama misi *", placeholder="mis. POSM Poster").strip()
+            ikon = st.text_input("Ikon (emoji)", value="📌").strip()
+            jml = st.number_input("Poin per klaim *", min_value=1, value=500, step=50)
+            c1, c2 = st.columns(2)
+            mulai = c1.date_input("Mulai", value=today_wib(), format="DD-MM-YYYY")
+            selesai = c2.date_input("Selesai (kosongkan = tanpa batas)", value=None,
+                                    format="DD-MM-YYYY")
+            ket = st.text_input("Isian wajib (opsional)",
+                                placeholder="mis. Brand rokok yang diecer").strip()
+            desk = st.text_input("Petunjuk foto",
+                                 placeholder="mis. Foto poster kami yang terpasang").strip()
+            if st.form_submit_button("Tambah Misi", use_container_width=True):
+                kode_baru = re.sub(r"[^a-z0-9]+", "_", nama.lower()).strip("_")
+                if not kode_baru:
+                    st.error("Nama misi wajib diisi.")
+                elif kode_baru in set(df.kode):
+                    st.error("Misi dengan nama itu sudah ada.")
+                elif selesai and selesai < mulai:
+                    st.error("Tanggal selesai harus setelah tanggal mulai.")
+                else:
+                    tambah("Program", {
+                        "kode": kode_baru, "nama": nama, "ikon": ikon or "📌", "jenis": "misi",
+                        "poin": int(jml), "aktif": "ya", "mulai": mulai.isoformat(),
+                        "selesai": selesai.isoformat() if selesai else "",
+                        "keterangan": ket, "deskripsi": desk,
+                        "diubah_oleh": st.session_state.nama,
+                        "diubah_pada": now_wib().isoformat(timespec="seconds"),
+                    })
+                    st.success(f"Misi {nama} ditambahkan.")
 
 
 # ================== ROUTER ==================
@@ -1492,7 +1648,8 @@ def main():
             st.sidebar.warning(f"🔔 {n} pengajuan toko menunggu approval")
         menu = st.sidebar.radio(
             "Menu",
-            ["Approval", "Input Nota", "Rekap Poin", "Penukaran Poin", "Daftar Toko"],
+            ["Approval", "Input Nota", "Rekap Poin", "Penukaran Poin", "Daftar Toko",
+             "Atur Program"],
         )
         {
             "Approval": sales_approval,
@@ -1500,6 +1657,7 @@ def main():
             "Rekap Poin": sales_rekap,
             "Penukaran Poin": sales_penukaran,
             "Daftar Toko": sales_daftar_toko,
+            "Atur Program": sales_program,
         }[menu]()
 
 
