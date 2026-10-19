@@ -1364,7 +1364,7 @@ def kartu_misi(kode, jenis, minta_brand=False):
         if minta_brand:
             brand = st.text_input(
                 "Brand rokok yang diecer",
-                placeholder="mis. Surya 12, Gudang Garam Filter, Sampoerna Mild",
+                placeholder="mis. ALVA, Wismilak Slim Klik, Diplomat EVO, dsb.",
                 key=f"mbrand_{jenis}{v}",
             ).strip()
 
