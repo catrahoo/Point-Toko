@@ -80,6 +80,10 @@ if not SHEET_URL and SHEET_ID:
     SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 GEMINI_API_KEY = secret("GEMINI_API_KEY")
 GEMINI_MODEL = secret("GEMINI_MODEL", "gemini-2.0-flash")
+# Foto disimpan ke Drive pribadi lewat Apps Script (lihat FotoAPI.gs)
+FOTO_SCRIPT_URL = str(secret("FOTO_SCRIPT_URL", "") or "").strip()
+FOTO_TOKEN = str(secret("FOTO_TOKEN", "") or "").strip()
+FOTO_MAKS_UMUR_MENIT = 15  # foto cadangan (upload) harus diambil maks 15 menit lalu
 # Master customer (sama dengan app Cek Koordinat), hanya dibaca
 CUSTOMER_SHEET_ID = _ambil_sheet_id(
     secret("CUSTOMER_SHEET_ID", "113E5fKvZ0wWloSbQ9IQo8QiCOz5C3zlJr28012PbXz4"))
@@ -103,9 +107,11 @@ COLS = {
              "username", "zona", "rayon"],
     "Transaksi": ["id", "kode_toko", "nama_toko", "no_nota", "tanggal", "jumlah_pack", "poin",
                   "status", "sumber", "deskripsi", "catatan", "sales", "diproses_oleh",
-                  "diproses_pada", "dibuat", "foto_id", "foto_link", "ai_pack", "ai_baca"],
+                  "diproses_pada", "dibuat", "foto_id", "foto_link", "ai_pack", "ai_baca",
+                  "foto_mode", "foto_hash"],
     "Misi": ["id", "kode_toko", "nama_toko", "jenis", "minggu", "keterangan", "poin", "status",
-             "catatan", "diproses_oleh", "diproses_pada", "dibuat", "foto_id", "foto_link"],
+             "catatan", "diproses_oleh", "diproses_pada", "dibuat", "foto_id", "foto_link",
+             "foto_mode", "foto_hash"],
     "Penukaran": ["id", "kode_toko", "nama_toko", "tanggal", "poin", "keterangan", "dibuat"],
 }
 KOLOM_ANGKA = {"jumlah_pack", "poin", "ai_pack"}
@@ -378,19 +384,27 @@ def _folder_id(subfolder: str) -> str:
     return _find_or_create(subfolder, root_id)
 
 
+def _foto_api(action, **kw):
+    """Panggil Foto API (Apps Script) yang menyimpan foto di Drive pribadi pemilik."""
+    if not (FOTO_SCRIPT_URL and FOTO_TOKEN):
+        raise RuntimeError("FOTO_SCRIPT_URL / FOTO_TOKEN belum diisi di Secrets")
+    r = requests.post(FOTO_SCRIPT_URL, json={"token": FOTO_TOKEN, "action": action, **kw},
+                      timeout=90)
+    try:
+        hasil = r.json()
+    except ValueError:
+        raise RuntimeError("Balasan Foto API tidak terbaca. Cek URL /exec dan akses "
+                           "'Siapa saja' pada deployment Apps Script.")
+    if not hasil.get("ok"):
+        raise RuntimeError(hasil.get("error", "Foto API gagal"))
+    return hasil
+
+
 def _upload_foto(data: bytes, filename: str, sheet_nama: str) -> tuple[str, str]:
-    """Upload foto ke Drive. Returns (file_id, web_view_link)."""
-    sub = FOLDER_MAP.get(sheet_nama, sheet_nama)
-    fid = _folder_id(sub)
-    drive = _drive()
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="image/jpeg", resumable=False)
-    meta = {"name": filename, "parents": [fid]}
-    f = drive.files().create(body=meta, media_body=media, fields="id,webViewLink").execute()
-    drive.permissions().create(
-        fileId=f["id"],
-        body={"role": "reader", "type": "anyone"},
-    ).execute()
-    return f["id"], f.get("webViewLink", "")
+    """Upload foto ke Drive pribadi lewat Apps Script. Returns (file_id, link)."""
+    h = _foto_api("upload", b64=base64.b64encode(data).decode(), mime="image/jpeg",
+                  name=filename, folder=FOLDER_MAP.get(sheet_nama, sheet_nama))
+    return h["id"], h.get("url", "")
 
 
 # ================== DATABASE: GOOGLE SHEETS ==================
@@ -488,7 +502,9 @@ def tambah(sheet, row, foto=None, nama_foto="foto"):
                 row["foto_id"] = fid
                 row["foto_link"] = furl
             except Exception as e:
-                st.warning(f"Foto gagal diupload ke Drive: {e}")
+                # jangan simpan data tanpa foto; pesan tetap tampil (tidak hilang oleh rerun)
+                st.error(f"❌ Foto gagal disimpan ke Drive, data BELUM terkirim. Detail: {e}")
+                st.stop()
         baris = []
         for c in cols:
             v = row.get(c, "")
@@ -530,7 +546,7 @@ def hapus(sheet, key, value):
             fid = ws.cell(r, fi).value
             if fid:
                 try:
-                    _drive().files().delete(fileId=fid).execute()
+                    _foto_api("delete", id=fid)
                 except Exception:
                     pass
         ws.delete_rows(r)
@@ -541,16 +557,13 @@ def hapus(sheet, key, value):
 def ambil_foto(foto_id: str):
     if not foto_id:
         return None
-    buf = io.BytesIO()
-    request = _drive().files().get_media(fileId=foto_id)
-    dl = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = dl.next_chunk()
-    return buf.getvalue()
+    return base64.b64decode(_foto_api("get", id=foto_id)["b64"])
 
 
 def tampil_foto(foto_id):
+    if not foto_id:
+        st.caption("📷 (tidak ada foto tersimpan)")
+        return
     try:
         b = ambil_foto(foto_id)
         if b:
@@ -614,6 +627,97 @@ def ringkas_ai(h):
     if h.get("catatan"):
         teks += f" (Catatan AI: {h['catatan']})"
     return teks
+
+
+# ================== FOTO LANGSUNG (anti-curang) ==================
+_BROWSER_DALAM_APP = ("FBAN", "FBAV", "Instagram", "Line/", "WhatsApp", "; wv)",
+                      "MicroMessenger", "TikTok", "musical_ly")
+
+
+def _browser_dalam_app():
+    try:
+        ua = st.context.headers.get("User-Agent", "") or ""
+    except Exception:
+        return False
+    return any(k in ua for k in _BROWSER_DALAM_APP)
+
+
+def _waktu_exif(raw):
+    """Waktu pengambilan foto dari data EXIF kamera, atau None."""
+    try:
+        exif = Image.open(io.BytesIO(raw)).getexif()
+        val = None
+        try:
+            val = exif.get_ifd(0x8769).get(36867)  # DateTimeOriginal
+        except Exception:
+            pass
+        val = val or exif.get(306)  # DateTime
+        if not val:
+            return None
+        return datetime.strptime(str(val).strip()[:19], "%Y:%m:%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _foto_masih_baru(t_foto):
+    """Maks FOTO_MAKS_UMUR_MENIT lalu. Toleransi jam HP WIB/WITA/WIT & selisih 5 menit."""
+    selisih = (now_wib() - t_foto).total_seconds() / 60
+    return any(-5 <= selisih + off <= FOTO_MAKS_UMUR_MENIT for off in (0, 60, 120))
+
+
+def foto_sudah_dipakai(h):
+    return bool(h) and any((tabel(n).foto_hash == h).any() for n in ("Transaksi", "Misi"))
+
+
+def panduan_kamera():
+    with st.expander("❓ Kamera tidak muncul / minta izin terus?"):
+        st.markdown(
+            "1. Saat muncul pertanyaan izin kamera, pilih **Izinkan / Allow**.\n"
+            "2. Pernah menolak? Ketuk ikon 🔒 di samping alamat web → **Izin / Permissions** → "
+            "**Kamera** → **Izinkan**, lalu muat ulang halaman.\n"
+            "3. Buka link di **Google Chrome** (Android) atau **Safari** (iPhone), jangan dari "
+            "dalam WhatsApp / Instagram / Facebook.\n"
+            "4. Tutup aplikasi lain yang sedang memakai kamera, lalu muat ulang.\n"
+            "5. Masih gagal? Pilih **📱 Kamera HP (cadangan)** di atas."
+        )
+
+
+def ambil_foto_langsung(key, label):
+    """Foto real-time. Return dict {bytes, mode, hash} atau None.
+    Kamera langsung (utama) atau kamera HP (cadangan, dicek waktu EXIF)."""
+    if _browser_dalam_app():
+        st.warning("⚠️ Anda membuka aplikasi dari dalam WhatsApp/Instagram/Facebook. Kamera "
+                   "sering tidak bisa dibuka di sini. Ketuk ⋮ lalu pilih **Buka di Chrome / "
+                   "Open in browser**.")
+    cara = st.radio("Cara foto", ["📷 Kamera langsung", "📱 Kamera HP (cadangan)"],
+                    horizontal=True, key=f"{key}_cara")
+    if cara.startswith("📷"):
+        f = st.camera_input(label, key=f"{key}_cam")
+        panduan_kamera()
+        if f is None:
+            return None
+        raw = f.getvalue()
+        return {"bytes": raw, "mode": "kamera langsung", "hash": hashlib.md5(raw).hexdigest()}
+
+    st.caption(f"Ketuk tombol di bawah → pilih **Kamera** → foto sekarang juga. Foto dari "
+               f"galeri, screenshot, atau kiriman WhatsApp akan ditolak (maks "
+               f"{FOTO_MAKS_UMUR_MENIT} menit sejak foto diambil).")
+    f = st.file_uploader(label, type=["jpg", "jpeg"], key=f"{key}_up")
+    if f is None:
+        return None
+    raw = f.getvalue()
+    t = _waktu_exif(raw)
+    if t is None:
+        st.error("❌ Foto ini tidak punya data waktu pengambilan (biasanya screenshot, hasil "
+                 "edit, atau kiriman WhatsApp). Ambil foto baru langsung dengan kamera.")
+        return None
+    if not _foto_masih_baru(t):
+        st.error(f"❌ Foto ini diambil {t:%d-%m-%Y %H:%M}. Foto harus baru diambil (maks "
+                 f"{FOTO_MAKS_UMUR_MENIT} menit). Silakan foto ulang sekarang.")
+        return None
+    st.image(raw, use_container_width=True)
+    return {"bytes": raw, "mode": f"kamera HP {t:%d-%m-%Y %H:%M}",
+            "hash": hashlib.md5(raw).hexdigest()}
 
 
 # ================== HELPER ==================
@@ -774,6 +878,8 @@ def sales_approval_nota():
         with st.container(border=True):
             st.markdown(f"**{r.nama_toko}** ({r.kode_toko}) · diajukan {waktu(r.dibuat)}")
             tampil_foto(r.foto_id)
+            if str(r.foto_mode).startswith("kamera HP"):
+                st.info(f"📱 Foto lewat jalur cadangan ({r.foto_mode}). Cek foto lebih teliti.")
             st.write(f"**Deskripsi dari toko:** {r.deskripsi or '-'}")
             if r.ai_baca:
                 st.write(f"**🤖 Bacaan AI saat foto diambil:** {r.ai_baca}")
@@ -835,6 +941,8 @@ def sales_approval_misi():
                 f"minggu {r.minggu} · diajukan {waktu(r.dibuat)}"
             )
             tampil_foto(r.foto_id)
+            if str(r.foto_mode).startswith("kamera HP"):
+                st.info(f"📱 Foto lewat jalur cadangan ({r.foto_mode}). Cek foto lebih teliti.")
             if r.keterangan:
                 label = "Brand yang diecer" if r.jenis == "eceran" else "Keterangan"
                 st.write(f"**{label}:** {r.keterangan}")
@@ -1150,11 +1258,11 @@ def toko_tambah_poin():
 
     v = st.session_state.setdefault("form_ver", 0)
 
-    foto = st.camera_input("📷 Foto nota (langsung dari kamera)", key=f"cam{v}")
+    foto = ambil_foto_langsung(f"nota{v}", "📷 Foto nota")
 
     hasil_ai = None
     if foto is not None and GEMINI_API_KEY:
-        img = foto.getvalue()
+        img = foto["bytes"]
         sidik = hashlib.md5(img).hexdigest()
         try:
             with st.spinner("🤖 AI sedang membaca nota..."):
@@ -1209,6 +1317,10 @@ def toko_tambah_poin():
         if not pack:
             st.error("Isi total pembelian (pack).")
             return
+        segarkan()
+        if foto_sudah_dipakai(foto["hash"]):
+            st.error("❌ Foto ini sudah pernah dikirim sebelumnya. Ambil foto baru.")
+            return
         now = now_wib()
         tambah("Transaksi", {
             "kode_toko": kode, "nama_toko": st.session_state.nama, "no_nota": "",
@@ -1217,7 +1329,8 @@ def toko_tambah_poin():
             "deskripsi": desk.strip(), "dibuat": now.isoformat(timespec="seconds"),
             "ai_pack": hasil_ai["total_pack"] if hasil_ai else "",
             "ai_baca": ringkas_ai(hasil_ai) if hasil_ai else "",
-        }, foto=foto, nama_foto=f"{kode}_nota_{now:%Y%m%d_%H%M%S}")
+            "foto_mode": foto["mode"], "foto_hash": foto["hash"],
+        }, foto=foto["bytes"], nama_foto=f"{kode}_nota_{now:%Y%m%d_%H%M%S}")
         st.session_state.form_ver = v + 1
         st.session_state.toko_kirim_ok = True
         st.rerun()
@@ -1246,7 +1359,7 @@ def kartu_misi(kode, jenis, minta_brand=False):
         else:
             st.caption(f"Foto {info['nama'].replace('POSM ', '').lower()} kami yang "
                        "terpasang di toko Anda.")
-        foto = st.camera_input(f"📷 Foto {info['nama']}", key=f"mcam_{jenis}{v}")
+        foto = ambil_foto_langsung(f"misi_{jenis}{v}", f"📷 Foto {info['nama']}")
         brand = ""
         if minta_brand:
             brand = st.text_input(
@@ -1266,13 +1379,17 @@ def kartu_misi(kode, jenis, minta_brand=False):
             segarkan()
             if status_misi_minggu_ini(kode, jenis):
                 st.rerun()
+            if foto_sudah_dipakai(foto["hash"]):
+                st.error("❌ Foto ini sudah pernah dikirim sebelumnya. Ambil foto baru.")
+                return
             mg, _ = minggu_ini()
             now = now_wib()
             tambah("Misi", {
                 "kode_toko": kode, "nama_toko": st.session_state.nama, "jenis": jenis,
                 "minggu": mg, "keterangan": brand, "poin": info["poin"],
                 "status": "pending", "dibuat": now.isoformat(timespec="seconds"),
-            }, foto=foto, nama_foto=f"{kode}_{jenis}_{now:%Y%m%d_%H%M%S}")
+                "foto_mode": foto["mode"], "foto_hash": foto["hash"],
+            }, foto=foto["bytes"], nama_foto=f"{kode}_{jenis}_{now:%Y%m%d_%H%M%S}")
             st.session_state[f"misi_ver_{jenis}"] = v + 1
             st.toast(f"{info['nama']} terkirim! Tunggu konfirmasi sales.")
             st.rerun()
@@ -1291,13 +1408,27 @@ def toko_misi():
         f"dikonfirmasi sales. Minggu baru mulai Senin, {senin_depan:%d-%m-%Y}."
     )
 
-    st.markdown("## 🚬 Sedia Eceran")
-    kartu_misi(kode, "eceran", minta_brand=True)
+    # Ringkasan status semua misi minggu ini
+    label_status = {"approved": "✅ Selesai", "pending": "⏳ Menunggu sales", None: "🔓 Tersedia"}
+    status = {j: status_misi_minggu_ini(kode, j) for j in MISI}
+    for j, info in MISI.items():
+        st.markdown(f"{info['ikon']} **{info['nama']}** (+{poin(info['poin'])}) · "
+                    f"{label_status[status[j]]}")
 
-    st.markdown("## 📌 Misi POSM")
-    st.caption("Pasang POSM kami lalu foto. Sunblind dan stiker bisa diklaim dua-duanya.")
-    kartu_misi(kode, "sunblind")
-    kartu_misi(kode, "stiker")
+    tersedia = [j for j in MISI if status[j] is None]
+    if not tersedia:
+        st.success(f"🎉 Semua misi minggu ini sudah dikirim. Misi dibuka lagi Senin, "
+                   f"{senin_depan:%d-%m-%Y}.")
+        return
+
+    st.markdown("### Kerjakan misi")
+    st.caption("Sunblind dan stiker bisa diklaim dua-duanya, satu per satu.")
+    # hanya 1 kamera aktif sekaligus supaya kamera HP tidak bentrok
+    if st.session_state.get("misi_pilih") not in tersedia:
+        st.session_state.pop("misi_pilih", None)
+    j = st.radio("Pilih misi", tersedia, horizontal=True, key="misi_pilih",
+                 format_func=lambda x: f"{MISI[x]['ikon']} {MISI[x]['nama']}")
+    kartu_misi(kode, j, minta_brand=(j == "eceran"))
 
 
 # ================== ROUTER ==================
@@ -1320,7 +1451,9 @@ def halaman_belum_setup():
         'SALES_PASSWORD = "password-sales"\n'
         'GSHEET_ID = "spreadsheet-id-dari-url"\n'
         'GSHEET_URL = "https://docs.google.com/spreadsheets/d/.../edit"\n'
-        'GEMINI_API_KEY = "AIza..."  # opsional\n\n'
+        'GEMINI_API_KEY = "AIza..."  # opsional\n'
+        'FOTO_SCRIPT_URL = "https://script.google.com/macros/s/.../exec"\n'
+        'FOTO_TOKEN = "token-yang-sama-dengan-di-FotoAPI.gs"\n\n'
         '[gcp_json]\n'
         '# Paste isi JSON service account di sini (lihat README)\n'
         "```"
@@ -1352,6 +1485,8 @@ def main():
         {"Saldo Poin": toko_saldo, "Tambah Poin": toko_tambah_poin,
          "Misi Bonus": toko_misi}[menu]()
     else:
+        if not (FOTO_SCRIPT_URL and FOTO_TOKEN):
+            st.sidebar.error("📷 Penyimpanan foto belum diatur (FOTO_SCRIPT_URL / FOTO_TOKEN).")
         n = jumlah_pending() + jumlah_pending(sheet="Misi")
         if n:
             st.sidebar.warning(f"🔔 {n} pengajuan toko menunggu approval")
