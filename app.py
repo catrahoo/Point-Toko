@@ -274,8 +274,14 @@ def _drive():
     return build("drive", "v3", credentials=_creds())
 
 
+@st.cache_resource
 def _wb():
     return _gc().open_by_key(SHEET_ID)
+
+
+@st.cache_resource
+def _header_sudah_dicek():
+    return set()
 
 
 # ================== MASTER CUSTOMER ==================
@@ -422,23 +428,23 @@ def _upload_foto(data: bytes, filename: str, sheet_nama: str) -> tuple[str, str]
 
 # ================== DATABASE: GOOGLE SHEETS ==================
 
-@st.cache_data(ttl=60, show_spinner="Memuat data...")
+@st.cache_data(ttl=180, show_spinner="Memuat data...")
 def _muat_semua():
     wb = _wb()
     result = {}
+    ada = {ws.title for ws in wb.worksheets()}
     for nama, cols in COLS.items():
-        try:
-            ws = wb.worksheet(nama)
-        except gspread.WorksheetNotFound:
-            ws = wb.add_worksheet(nama, rows=1000, cols=len(cols))
-            ws.update([cols], "A1")
-            result[nama] = []
-            continue
-        rows = ws.get_all_values()
+        if nama not in ada:
+            wb.add_worksheet(nama, rows=1000, cols=len(cols)).update([cols], "A1")
+    # semua sheet dibaca sekaligus dalam 1 permintaan ke Google (jauh lebih cepat)
+    hasil = wb.values_batch_get([f"'{n}'" for n in COLS]).get("valueRanges", [])
+    for nama, vr in zip(COLS, hasil):
+        cols = COLS[nama]
+        rows = vr.get("values", [])
         if len(rows) < 2:
             # Pastikan header ada
             if not rows:
-                ws.update([cols], "A1")
+                wb.worksheet(nama).update([cols], "A1")
             result[nama] = []
             continue
         headers = rows[0]
@@ -475,10 +481,12 @@ def _ws_ensure(nama) -> gspread.Worksheet:
         ws = wb.add_worksheet(nama, rows=1000, cols=len(COLS[nama]))
         ws.update([COLS[nama]], "A1")
         return ws
-    # Pastikan header row benar
-    header = ws.row_values(1)
-    if header != COLS[nama]:
-        ws.update([COLS[nama]], "A1")
+    # Pastikan header row benar (cukup dicek sekali per sheet)
+    cek = _header_sudah_dicek()
+    if nama not in cek:
+        if ws.row_values(1) != COLS[nama]:
+            ws.update([COLS[nama]], "A1")
+        cek.add(nama)
     return ws
 
 
@@ -573,9 +581,26 @@ def ambil_foto(foto_id: str):
     return base64.b64decode(_foto_api("get", id=foto_id)["b64"])
 
 
+# Folder foto di Drive dibagikan "Siapa saja yang punya link", jadi browser bisa memuat
+# foto langsung dari Drive (cepat). Set False jika folder dibuat terbatas (lebih lambat).
+FOTO_LINK_LANGSUNG = True
+
+
+def url_foto(foto_id, lebar=1000):
+    return f"https://drive.google.com/thumbnail?id={foto_id}&sz=w{lebar}"
+
+
 def tampil_foto(foto_id):
     if not foto_id:
         st.caption("📷 (tidak ada foto tersimpan)")
+        return
+    if FOTO_LINK_LANGSUNG:
+        st.markdown(
+            f'<img src="{url_foto(foto_id)}" loading="lazy" '
+            f'style="width:100%;border-radius:12px;background:rgba(255,255,255,.08);min-height:80px">'
+            f'<div style="font-size:.8rem;margin-top:4px"><a href="https://drive.google.com/file/d/'
+            f'{foto_id}/view" target="_blank" style="color:#dbe9ff">🔗 Buka foto ukuran penuh</a>'
+            f'</div>', unsafe_allow_html=True)
         return
     try:
         b = ambil_foto(foto_id)
@@ -851,14 +876,16 @@ def potong_persegi(raw, ukuran=640):
 
 def avatar_html(foto_id, nama, ukuran=56):
     """Lingkaran foto profil; inisial nama jika belum ada foto."""
+    gaya = (f"width:{ukuran}px;height:{ukuran}px;border-radius:50%;object-fit:cover;"
+            f"border:2px solid #fff;flex-shrink:0")
+    if foto_id and FOTO_LINK_LANGSUNG:
+        return f'<img src="{url_foto(foto_id, 300)}" loading="lazy" style="{gaya}">'
     b = None
     if foto_id:
         try:
             b = ambil_foto(foto_id)
         except Exception:
             b = None
-    gaya = (f"width:{ukuran}px;height:{ukuran}px;border-radius:50%;object-fit:cover;"
-            f"border:2px solid #fff;flex-shrink:0")
     if b:
         return (f'<img src="data:image/jpeg;base64,{base64.b64encode(b).decode()}" '
                 f'style="{gaya}">')
