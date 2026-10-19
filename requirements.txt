@@ -1,2 +1,7 @@
-streamlit>=1.38
+streamlit
 pandas
+requests
+Pillow
+gspread
+google-auth
+google-api-python-client
