@@ -6,6 +6,8 @@ Jalankan: streamlit run app.py
 """
 import base64
 import hashlib
+import hmac
+import time
 import io
 import json
 import re
@@ -96,6 +98,14 @@ PROGRAM_DEFAULT = [
 ]
 PROGRAM_DIHAPUS = {"eceran", "sunblind", "stiker"}  # misi contoh lama, dibuang dari sheet
 
+# Batas klaim misi per toko
+FREKUENSI = {
+    "harian": "1x per hari",
+    "mingguan": "1x per minggu (Senin–Minggu)",
+    "bulanan": "1x per bulan",
+    "sekali": "1x selama program",
+}
+
 STATUS_LABEL = {
     "pending":  "⏳ Menunggu approval",
     "approved": "✅ Disetujui",
@@ -115,7 +125,7 @@ COLS = {
              "foto_mode", "foto_hash"],
     "Penukaran": ["id", "kode_toko", "nama_toko", "tanggal", "poin", "keterangan", "dibuat"],
     "Program": ["kode", "nama", "ikon", "jenis", "poin", "aktif", "mulai", "selesai",
-                "keterangan", "deskripsi", "diubah_oleh", "diubah_pada"],
+                "keterangan", "deskripsi", "diubah_oleh", "diubah_pada", "frekuensi"],
 }
 KOLOM_ANGKA = {"jumlah_pack", "poin", "ai_pack"}
 
@@ -690,6 +700,8 @@ def program_df():
         df = tabel("Program")
     df = df[df.kode.str.strip() != ""].drop_duplicates("kode").copy()
     df["aktif"] = df.aktif.str.strip().str.lower()
+    df["frekuensi"] = df.frekuensi.str.strip().str.lower().where(
+        df.frekuensi.str.strip().str.lower().isin(FREKUENSI), "mingguan")
     return df.reset_index(drop=True)
 
 
@@ -943,11 +955,32 @@ def minggu_ini():
     return f"{th}-W{mg:02d}", senin_depan
 
 
-def status_misi_minggu_ini(kode, jenis):
-    mg, _ = minggu_ini()
+def periode_klaim(frek):
+    """(kunci periode, teks kapan dibuka lagi) sesuai batas klaim program."""
+    hari = today_wib()
+    if frek == "harian":
+        return hari.isoformat(), f"besok, {hari + timedelta(days=1):%d-%m-%Y}"
+    if frek == "bulanan":
+        awal_depan = (hari.replace(day=28) + timedelta(days=4)).replace(day=1)
+        return f"{hari:%Y-%m}", f"tanggal {awal_depan:%d-%m-%Y}"
+    if frek == "sekali":
+        return "SEKALI", ""
+    kunci, senin_depan = minggu_ini()
+    return kunci, f"Senin, {senin_depan:%d-%m-%Y}"
+
+
+def status_misi_periode(kode, prog):
+    """Status klaim toko untuk periode berjalan (None = masih bisa klaim)."""
+    kunci, _ = periode_klaim(prog["frekuensi"])
     m = tabel("Misi")
-    m = m[(m.kode_toko == kode) & (m.jenis == jenis) & (m.minggu == mg)
+    m = m[(m.kode_toko == kode) & (m.jenis == prog["kode"])
           & m.status.isin(["pending", "approved"])]
+    if prog["frekuensi"] == "sekali":
+        mulai = str(prog.get("mulai", ""))[:10]
+        if mulai:
+            m = m[m.dibuat.str[:10] >= mulai]
+    else:
+        m = m[m.minggu == kunci]
     if m.empty:
         return None
     return "approved" if (m.status == "approved").any() else "pending"
@@ -963,6 +996,59 @@ def poin(x):
 
 def waktu(s):
     return str(s)[:16].replace("T", " ")
+
+
+# ================== SESI LOGIN (tetap login walau di-refresh) ==================
+SESI_HARI = 30  # lama login tersimpan
+
+
+def _kunci_sesi():
+    return str(secret("SESSION_SECRET", "") or (FOTO_TOKEN + SHEET_ID + "poin-toko")).encode()
+
+
+def _tanda(teks):
+    return hmac.new(_kunci_sesi(), teks.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def buat_sesi(role, ident):
+    """Simpan token login bertanda tangan di URL (?s=...), jadi refresh tidak logout."""
+    isi = f"{role}|{ident}|{int(time.time()) + SESI_HARI * 86400}"
+    st.query_params["s"] = (base64.urlsafe_b64encode(isi.encode()).decode().rstrip("=")
+                            + "." + _tanda(isi))
+
+
+def pulihkan_sesi():
+    """Kalau halaman di-refresh, login dipulihkan dari token di URL."""
+    if st.session_state.get("role"):
+        return
+    token = st.query_params.get("s", "")
+    try:
+        bagian, tanda = token.rsplit(".", 1)
+        isi = base64.urlsafe_b64decode(bagian + "=" * (-len(bagian) % 4)).decode()
+        role, ident, exp = isi.split("|")
+        if not hmac.compare_digest(tanda, _tanda(isi)) or int(exp) < time.time():
+            raise ValueError
+    except Exception:
+        if token:
+            st.query_params.pop("s", None)
+        return
+    if role == "sales" and ident in SALES_AKUN:
+        st.session_state.update(role="sales", nama=ident)
+    elif role == "toko":
+        t = tabel("Toko")
+        r = t[t.kode_toko == ident]
+        if len(r):
+            st.session_state.update(role="toko", kode_toko=ident, nama=r.nama_toko.iloc[0])
+
+
+def pilih_menu(daftar):
+    """Menu sidebar yang juga diingat di URL (?m=...)."""
+    awal = st.query_params.get("m", daftar[0])
+    menu = st.sidebar.radio("Menu", daftar,
+                            index=daftar.index(awal) if awal in daftar else 0)
+    if st.query_params.get("m") != menu:
+        st.query_params["m"] = menu
+    return menu
 
 
 # ================== LOGIN ==================
@@ -988,6 +1074,7 @@ def halaman_login():
                 if user and pw and len(r):
                     st.session_state.update(role="toko", kode_toko=r.kode_toko.iloc[0],
                                             nama=r.nama_toko.iloc[0])
+                    buat_sesi("toko", r.kode_toko.iloc[0])
                     st.rerun()
                 else:
                     st.error("Username atau password salah.")
@@ -999,6 +1086,7 @@ def halaman_login():
             if st.form_submit_button("Masuk", use_container_width=True):
                 if nama in SALES_AKUN and pw == SALES_AKUN[nama]:
                     st.session_state.update(role="sales", nama=nama)
+                    buat_sesi("sales", nama)
                     st.rerun()
                 else:
                     st.error("Username atau password salah.")
@@ -1024,6 +1112,7 @@ def tombol_keluar():
             st.rerun()
         if st.button("Keluar", use_container_width=True):
             st.session_state.clear()
+            st.query_params.clear()
             st.rerun()
 
 
@@ -1539,18 +1628,21 @@ def toko_tambah_poin():
 def kartu_misi(kode, prog):
     """Satu kartu misi. Kamera hanya dibuka untuk 1 misi sekaligus."""
     jenis = prog["kode"]
-    _, senin_depan = minggu_ini()
+    frek = prog["frekuensi"]
+    _, buka_lagi = periode_klaim(frek)
+    kata = {"harian": "hari ini", "mingguan": "minggu ini", "bulanan": "bulan ini",
+            "sekali": "untuk program ini"}[frek]
     with st.container(border=True):
         judul_program(f"{prog['ikon']} {prog['nama']} · +{poin(prog['poin'])}", prog)
-        if prog["deskripsi"]:
-            st.caption(prog["deskripsi"])
-        status = status_misi_minggu_ini(kode, jenis)
+        st.caption(f"🔁 Bisa diklaim {FREKUENSI[frek]}"
+                   + (f" · {prog['deskripsi']}" if prog["deskripsi"] else ""))
+        status = status_misi_periode(kode, prog)
         if status == "pending":
-            st.info("⏳ Sudah dikirim minggu ini, menunggu konfirmasi sales.")
+            st.info(f"⏳ Sudah dikirim {kata}, menunggu konfirmasi sales.")
             return
         if status == "approved":
-            st.success(f"✅ Poin minggu ini sudah didapat. Dibuka lagi Senin, "
-                       f"{senin_depan:%d-%m-%Y}.")
+            st.success(f"✅ Poin {kata} sudah didapat."
+                       + (f" Bisa diklaim lagi {buka_lagi}." if buka_lagi else ""))
             return
 
         if st.session_state.get("misi_buka") != jenis:
@@ -1578,13 +1670,13 @@ def kartu_misi(kode, prog):
                 st.error(f"Isi {prog['keterangan'].lower()}.")
                 return
             segarkan()
-            if status_misi_minggu_ini(kode, jenis) or not program_berjalan(jenis):
+            if status_misi_periode(kode, prog) or not program_berjalan(jenis):
                 st.session_state.pop("misi_buka", None)
                 st.rerun()
             if foto_sudah_dipakai(foto["hash"]):
                 st.error("❌ Foto ini sudah pernah dikirim sebelumnya. Ambil foto baru.")
                 return
-            mg, _ = minggu_ini()
+            mg, _ = periode_klaim(frek)
             now = now_wib()
             tambah("Misi", {
                 "kode_toko": kode, "nama_toko": st.session_state.nama, "jenis": jenis,
@@ -1605,11 +1697,8 @@ def toko_misi():
         "**Jangan khawatir!** Jika mau tambahan poin, Bapak/Ibu cukup sediakan "
         "**Eceran** dan **POSM** kami. 🙏"
     )
-    _, senin_depan = minggu_ini()
-    st.caption(
-        f"Setiap misi bisa diklaim 1x per minggu (Senin–Minggu) dan poin masuk setelah "
-        f"dikonfirmasi sales. Minggu baru mulai Senin, {senin_depan:%d-%m-%Y}."
-    )
+    st.caption("Setiap misi punya batas klaim sendiri (lihat 🔁 di tiap kartu). Poin masuk "
+               "setelah dikonfirmasi sales.")
     daftar = misi_berjalan()
     if not daftar:
         st.info("Belum ada misi yang berjalan saat ini. Pantau terus ya! 🙏")
@@ -1636,6 +1725,8 @@ def sales_program():
             "Jenis": df.jenis.map({"pembelian": "Pembelian", "misi": "Misi foto"}).fillna(df.jenis),
             "Poin": df.poin.astype(str) + df.jenis.map({"pembelian": " /pack"}).fillna(" /klaim"),
             "Periode": [periode_program(r).replace("📅 ", "") for _, r in df.iterrows()],
+            "Batas klaim": [FREKUENSI[r["frekuensi"]] if r["jenis"] == "misi" else "Per nota"
+                            for _, r in df.iterrows()],
             "Status": [_status_program(r) for _, r in df.iterrows()],
         }),
         hide_index=True, use_container_width=True,
@@ -1663,6 +1754,11 @@ def sales_program():
         jml = c3.number_input("Poin per klaim *" if misi else "Poin per pack *",
                               min_value=1, value=max(int(p["poin"]), 1), step=50 if misi else 10)
         aktif = c4.toggle("Program aktif", value=p["aktif"] == "ya")
+        frek = p["frekuensi"]
+        if misi:
+            frek = st.selectbox("Batas klaim per toko", list(FREKUENSI),
+                                index=list(FREKUENSI).index(p["frekuensi"]),
+                                format_func=FREKUENSI.get)
         c5, c6 = st.columns(2)
         mulai = c5.date_input("Tanggal mulai (kosongkan = tanpa batas)",
                               value=ke_tgl(p["mulai"]), format="DD-MM-YYYY")
@@ -1687,7 +1783,7 @@ def sales_program():
                                      "ya" if aktif else "tidak",
                                      mulai.isoformat() if mulai else "",
                                      selesai.isoformat() if selesai else "",
-                                     ket, desk, st.session_state.nama, now])
+                                     ket, desk, st.session_state.nama, now, frek])
                     else:
                         rows.append([r[c] for c in COLS["Program"]])
                 with st.spinner("Menyimpan..."):
@@ -1712,6 +1808,8 @@ def sales_program():
             nama = st.text_input("Nama misi *", placeholder="mis. POSM Poster").strip()
             ikon = st.text_input("Ikon (emoji)", value="📌").strip()
             jml = st.number_input("Poin per klaim *", min_value=1, value=500, step=50)
+            frek_baru = st.selectbox("Batas klaim per toko", list(FREKUENSI), index=1,
+                                     format_func=FREKUENSI.get)
             c1, c2 = st.columns(2)
             mulai = c1.date_input("Mulai", value=today_wib(), format="DD-MM-YYYY")
             selesai = c2.date_input("Selesai (kosongkan = tanpa batas)", value=None,
@@ -1733,7 +1831,7 @@ def sales_program():
                         "kode": kode_baru, "nama": nama, "ikon": ikon or "📌", "jenis": "misi",
                         "poin": int(jml), "aktif": "ya", "mulai": mulai.isoformat(),
                         "selesai": selesai.isoformat() if selesai else "",
-                        "keterangan": ket, "deskripsi": desk,
+                        "keterangan": ket, "deskripsi": desk, "frekuensi": frek_baru,
                         "diubah_oleh": st.session_state.nama,
                         "diubah_pada": now_wib().isoformat(timespec="seconds"),
                     })
@@ -1783,14 +1881,14 @@ def main():
         st.caption("Cek format gcp_json di Secrets — harus berupa JSON service account yang valid.")
         return
 
+    pulihkan_sesi()
     role = st.session_state.get("role")
     if not role:
         halaman_login()
         return
     tombol_keluar()
     if role == "toko":
-        menu = st.sidebar.radio("Menu", ["Saldo Poin", "Tambah Poin", "Misi Bonus",
-                                         "Profil"])
+        menu = pilih_menu(["Saldo Poin", "Tambah Poin", "Misi Bonus", "Profil"])
         {"Saldo Poin": toko_saldo, "Tambah Poin": toko_tambah_poin,
          "Misi Bonus": toko_misi, "Profil": toko_profil}[menu]()
     else:
@@ -1799,11 +1897,8 @@ def main():
         n = jumlah_pending() + jumlah_pending(sheet="Misi")
         if n:
             st.sidebar.warning(f"🔔 {n} pengajuan toko menunggu approval")
-        menu = st.sidebar.radio(
-            "Menu",
-            ["Approval", "Input Nota", "Rekap Poin", "Penukaran Poin", "Daftar Toko",
-             "Atur Program"],
-        )
+        menu = pilih_menu(["Approval", "Input Nota", "Rekap Poin", "Penukaran Poin",
+                           "Daftar Toko", "Atur Program"])
         {
             "Approval": sales_approval,
             "Input Nota": sales_input_nota,
