@@ -1,7 +1,8 @@
-streamlit
+streamlit>=1.40
 pandas
 requests
-Pillow
 gspread
 google-auth
 google-api-python-client
+Pillow
+streamlit-js-eval
