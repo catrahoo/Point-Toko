@@ -440,10 +440,13 @@ def _upload_foto(data: bytes, filename: str, sheet_nama: str) -> tuple[str, str]
 def _muat_semua():
     wb = _wb()
     result = {}
-    ada = {ws.title for ws in wb.worksheets()}
+    ada = {ws.title: ws for ws in wb.worksheets()}
     for nama, cols in COLS.items():
         if nama not in ada:
             wb.add_worksheet(nama, rows=1000, cols=len(cols)).update([cols], "A1")
+        elif ada[nama].col_count < len(cols):
+            _cukupkan_kolom(ada[nama], len(cols))
+            ada[nama].update([cols], "A1")
     # semua sheet dibaca sekaligus dalam 1 permintaan ke Google (jauh lebih cepat)
     hasil = wb.values_batch_get([f"'{n}'" for n in COLS]).get("valueRanges", [])
     for nama, vr in zip(COLS, hasil):
@@ -492,10 +495,17 @@ def _ws_ensure(nama) -> gspread.Worksheet:
     # Pastikan header row benar (cukup dicek sekali per sheet)
     cek = _header_sudah_dicek()
     if nama not in cek:
+        _cukupkan_kolom(ws, len(COLS[nama]))
         if ws.row_values(1) != COLS[nama]:
             ws.update([COLS[nama]], "A1")
         cek.add(nama)
     return ws
+
+
+def _cukupkan_kolom(ws, butuh):
+    """Tambah kolom di sheet kalau kurang (mis. setelah ada kolom baru di aplikasi)."""
+    if ws.col_count < butuh:
+        ws.add_cols(butuh - ws.col_count)
 
 
 def _next_id(ws, cols) -> str:
