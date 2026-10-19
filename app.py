@@ -44,7 +44,8 @@ IMAGE_MAX_PX = 1920
 IMAGE_QUALITY = 75
 
 FOLDER_UTAMA = "Foto Poin Toko"
-FOLDER_MAP = {"Transaksi": "Nota Pembelian", "Misi": "Misi Bonus", "Profil": "Foto Profil"}
+FOLDER_MAP = {"Transaksi": "Nota Pembelian", "Misi": "Misi Bonus", "Profil": "Foto Profil",
+              "Hadiah": "Foto Hadiah"}
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -110,6 +111,7 @@ STATUS_LABEL = {
     "pending":  "⏳ Menunggu approval",
     "approved": "✅ Disetujui",
     "rejected": "❌ Ditolak",
+    "diserahkan": "📦 Sudah diserahkan",
 }
 
 # Kolom tiap sheet
@@ -126,6 +128,11 @@ COLS = {
     "Penukaran": ["id", "kode_toko", "nama_toko", "tanggal", "poin", "keterangan", "dibuat"],
     "Program": ["kode", "nama", "ikon", "jenis", "poin", "aktif", "mulai", "selesai",
                 "keterangan", "deskripsi", "diubah_oleh", "diubah_pada", "frekuensi"],
+    "Hadiah": ["id", "nama", "poin", "stok", "deskripsi", "aktif", "foto_id", "foto_link",
+               "dibuat", "diubah_oleh", "diubah_pada"],
+    "Klaim": ["id", "kode_toko", "nama_toko", "hadiah_id", "nama_hadiah", "poin", "status",
+              "catatan", "dibuat", "diproses_oleh", "diproses_pada", "diserahkan_oleh",
+              "diserahkan_pada"],
 }
 KOLOM_ANGKA = {"jumlah_pack", "poin", "ai_pack"}
 
@@ -947,6 +954,244 @@ def toko_profil():
             st.rerun()
 
 
+# ================== HADIAH ==================
+KLAIM_TERPAKAI = ["pending", "approved", "diserahkan"]  # status klaim yang memakai poin
+
+
+def stok_tersisa(h):
+    """None = tanpa batas; selain itu stok dikurangi klaim yang masih menunggu."""
+    stok = str(h["stok"]).strip()
+    if stok == "":
+        return None
+    k = tabel("Klaim")
+    menunggu = len(k[(k.hadiah_id == str(h["id"])) & (k.status == "pending")])
+    return max(int(float(stok)) - menunggu, 0)
+
+
+def kartu_hadiah_html(h, sisa):
+    foto = (f'<img src="{url_foto(h["foto_id"], 600)}" loading="lazy" style="width:100%;'
+            f'aspect-ratio:1/1;object-fit:cover;border-radius:14px">' if h["foto_id"] else
+            '<div style="aspect-ratio:1/1;display:flex;align-items:center;justify-content:center;'
+            'font-size:3rem;background:rgba(255,255,255,.1);border-radius:14px">🎁</div>')
+    stok = "Stok tanpa batas" if sisa is None else ("❌ Habis" if sisa == 0 else f"Sisa {sisa}")
+    return (f'<div style="border:1.5px solid rgba(255,255,255,.7);border-radius:18px;'
+            f'padding:10px;background:linear-gradient(180deg,rgba(74,155,240,.35),'
+            f'rgba(13,47,134,.55))">{foto}<div style="font-weight:900;margin-top:8px">'
+            f'{h["nama"]}</div><div style="font-size:1.15rem;font-weight:800">'
+            f'🪙 {poin(h["poin"])}</div><div style="font-size:.8rem;color:#dbe9ff">{stok}</div></div>')
+
+
+def toko_hadiah():
+    kode = st.session_state.kode_toko
+    st.subheader("🎁 Tukar Poin dengan Hadiah")
+    if msg := st.session_state.pop("hadiah_ok", None):
+        st.success(msg)
+    _, _, saldo = saldo_toko(kode)
+    st.metric("💰 Saldo poin Anda", poin(saldo))
+
+    hd = tabel("Hadiah")
+    hd = hd[hd.aktif.str.lower() == "ya"].sort_values("poin")
+    if hd.empty:
+        st.info("Belum ada hadiah yang tersedia. Pantau terus ya! 🙏")
+    kolom = st.columns(2)
+    for i, (_, h) in enumerate(hd.iterrows()):
+        with kolom[i % 2]:
+            sisa = stok_tersisa(h)
+            st.markdown(kartu_hadiah_html(h, sisa), unsafe_allow_html=True)
+            if h["deskripsi"]:
+                st.caption(h["deskripsi"])
+            kurang = int(h["poin"]) - saldo
+            if sisa == 0:
+                st.button("Stok habis", key=f"th_{h['id']}", disabled=True,
+                          use_container_width=True)
+            elif kurang > 0:
+                st.button(f"Kurang {poin(kurang)}", key=f"th_{h['id']}", disabled=True,
+                          use_container_width=True)
+            elif st.session_state.get("hadiah_konfirmasi") == h["id"]:
+                st.warning(f"Tukar {poin(h['poin'])} dengan **{h['nama']}**?")
+                b1, b2 = st.columns(2)
+                if b1.button("✅ Ya, tukar", key=f"ya_{h['id']}", type="primary",
+                             use_container_width=True):
+                    segarkan()  # cek ulang saldo & stok terbaru
+                    _, _, saldo_baru = saldo_toko(kode)
+                    if saldo_baru < int(h["poin"]) or stok_tersisa(h) == 0:
+                        st.error("Saldo atau stok sudah berubah. Coba lagi.")
+                    else:
+                        tambah("Klaim", {
+                            "kode_toko": kode, "nama_toko": st.session_state.nama,
+                            "hadiah_id": str(h["id"]), "nama_hadiah": h["nama"],
+                            "poin": int(h["poin"]), "status": "pending",
+                            "dibuat": now_wib().isoformat(timespec="seconds"),
+                        })
+                        st.session_state.pop("hadiah_konfirmasi", None)
+                        st.session_state.hadiah_ok = (f"✅ Pengajuan {h['nama']} terkirim. "
+                                                      "Poin ditahan sampai SPV menyetujui.")
+                        st.rerun()
+                if b2.button("Batal", key=f"no_{h['id']}", use_container_width=True):
+                    st.session_state.pop("hadiah_konfirmasi", None)
+                    st.rerun()
+            elif st.button("🎁 Tukar", key=f"th_{h['id']}", type="primary",
+                           use_container_width=True):
+                st.session_state.hadiah_konfirmasi = h["id"]
+                st.rerun()
+
+    k = tabel("Klaim")
+    riwayat = k[k.kode_toko == kode].sort_values("dibuat", ascending=False)
+    if not riwayat.empty:
+        st.divider()
+        st.subheader("Riwayat Tukar Hadiah")
+        st.dataframe(pd.DataFrame({
+            "Tanggal": riwayat.dibuat.str[:10], "Hadiah": riwayat.nama_hadiah,
+            "Poin": riwayat.poin, "Status": riwayat.status.map(STATUS_LABEL),
+            "Catatan": riwayat.catatan}), hide_index=True, use_container_width=True)
+        st.caption("Jika pengajuan ditolak, poin otomatis kembali ke saldo Anda.")
+
+
+def sales_approval_hadiah():
+    k = tabel("Klaim")
+    pend = k[k.status == "pending"].sort_values("dibuat")
+    if pend.empty:
+        st.success("Tidak ada pengajuan hadiah yang menunggu.")
+    hd = tabel("Hadiah")
+    for _, r in pend.iterrows():
+        with st.container(border=True):
+            st.markdown(f"**{r.nama_toko}** ({r.kode_toko}) · diajukan {waktu(r.dibuat)}")
+            st.write(f"🎁 **{r.nama_hadiah}** · {poin(r.poin)}")
+            h = hd[hd.id == r.hadiah_id]
+            if len(h) and h.foto_id.iloc[0]:
+                st.markdown(f'<img src="{url_foto(h.foto_id.iloc[0], 400)}" style="width:160px;'
+                            f'border-radius:12px">', unsafe_allow_html=True)
+            catatan = st.text_input("Catatan / alasan ditolak", key=f"hct{r.id}").strip()
+            b1, b2 = st.columns(2)
+            if b1.button("✅ Setujui", key=f"hok{r.id}", type="primary", use_container_width=True):
+                ubah("Klaim", "id", r.id, {
+                    "status": "approved", "catatan": catatan,
+                    "diproses_oleh": st.session_state.nama,
+                    "diproses_pada": now_wib().isoformat(timespec="seconds")})
+                if len(h) and str(h.stok.iloc[0]).strip() != "":
+                    ubah("Hadiah", "id", r.hadiah_id,
+                         {"stok": str(max(int(float(h.stok.iloc[0])) - 1, 0))})
+                st.toast(f"Disetujui: {r.nama_hadiah} untuk {r.nama_toko}")
+                st.rerun()
+            if b2.button("❌ Tolak", key=f"hno{r.id}", use_container_width=True):
+                if not catatan:
+                    st.error("Isi alasan penolakan dulu supaya toko tahu.")
+                else:
+                    ubah("Klaim", "id", r.id, {
+                        "status": "rejected", "catatan": catatan,
+                        "diproses_oleh": st.session_state.nama,
+                        "diproses_pada": now_wib().isoformat(timespec="seconds")})
+                    st.toast(f"Ditolak, {poin(r.poin)} kembali ke {r.nama_toko}")
+                    st.rerun()
+
+    siap = k[k.status == "approved"].sort_values("diproses_pada")
+    if not siap.empty:
+        st.markdown("### 📦 Menunggu diserahkan ke toko")
+        for _, r in siap.iterrows():
+            c1, c2 = st.columns([3, 1])
+            c1.write(f"**{r.nama_hadiah}** → {r.nama_toko} ({r.kode_toko}) · disetujui "
+                     f"{waktu(r.diproses_pada)}")
+            if c2.button("📦 Sudah diserahkan", key=f"hsr{r.id}", use_container_width=True):
+                ubah("Klaim", "id", r.id, {
+                    "status": "diserahkan", "diserahkan_oleh": st.session_state.nama,
+                    "diserahkan_pada": now_wib().isoformat(timespec="seconds")})
+                st.rerun()
+
+
+def sales_hadiah():
+    st.subheader("🎁 Atur Hadiah")
+    st.caption("Hadiah aktif tampil di menu toko. Stok kosong = tanpa batas. Stok berkurang "
+               "otomatis saat pengajuan disetujui.")
+    if msg := st.session_state.pop("hadiah_admin_ok", None):
+        st.success(msg)
+    hd = tabel("Hadiah")
+
+    if not hd.empty:
+        kolom = st.columns(3)
+        for i, (_, h) in enumerate(hd.iterrows()):
+            with kolom[i % 3]:
+                st.markdown(kartu_hadiah_html(h, stok_tersisa(h)), unsafe_allow_html=True)
+                if h["aktif"].lower() != "ya":
+                    st.caption("⏸️ Nonaktif (tidak tampil di toko)")
+
+        st.markdown("### ✏️ Edit hadiah")
+        opsi = {f"{r.nama} · {poin(r.poin)}": r.id for r in hd.itertuples()}
+        hid = opsi[st.selectbox("Pilih hadiah", list(opsi.keys()), key="edit_hadiah_pilih")]
+        h = hd[hd.id == hid].iloc[0]
+        with st.container(border=True):
+            nama = st.text_input("Nama hadiah *", value=h["nama"], key=f"h_nama_{hid}").strip()
+            c1, c2 = st.columns(2)
+            harga = c1.number_input("Harga (poin) *", min_value=1, value=max(int(h["poin"]), 1),
+                                    step=100, key=f"h_poin_{hid}")
+            aktif = c2.toggle("Tampil di toko", value=h["aktif"].lower() == "ya",
+                              key=f"h_aktif_{hid}")
+            tanpa_stok = st.checkbox("Stok tanpa batas", value=str(h["stok"]).strip() == "",
+                                     key=f"h_ts_{hid}")
+            stok = None if tanpa_stok else st.number_input(
+                "Stok", min_value=0, value=int(float(h["stok"] or 0)), step=1, key=f"h_stok_{hid}")
+            desk = st.text_area("Deskripsi", value=h["deskripsi"], key=f"h_desk_{hid}").strip()
+            foto = st.file_uploader("Ganti foto (opsional)", type=["jpg", "jpeg", "png"],
+                                    key=f"h_foto_{hid}")
+            b1, b2 = st.columns(2)
+            if b1.button("💾 Simpan perubahan", type="primary", use_container_width=True,
+                         key=f"h_simpan_{hid}"):
+                if not nama:
+                    st.error("Nama hadiah wajib diisi.")
+                else:
+                    fields = {"nama": nama, "poin": int(harga), "aktif": "ya" if aktif else "tidak",
+                              "stok": "" if stok is None else str(int(stok)), "deskripsi": desk,
+                              "diubah_oleh": st.session_state.nama,
+                              "diubah_pada": now_wib().isoformat(timespec="seconds")}
+                    if foto is not None:
+                        with st.spinner("Mengunggah foto..."):
+                            fid, furl = _upload_foto(compress_image(foto),
+                                                     f"hadiah_{hid}_{now_wib():%Y%m%d_%H%M%S}.jpg",
+                                                     "Hadiah")
+                        fields.update(foto_id=fid, foto_link=furl)
+                    ubah("Hadiah", "id", hid, fields)
+                    st.session_state.hadiah_admin_ok = f"✅ Hadiah {nama} tersimpan."
+                    st.rerun()
+            if b2.button("🗑️ Hapus hadiah", use_container_width=True, key=f"h_hapus_{hid}"):
+                hapus("Hadiah", "id", hid)
+                st.session_state.hadiah_admin_ok = f"Hadiah {h['nama']} dihapus."
+                st.rerun()
+
+    with st.expander("➕ Tambah hadiah baru", expanded=hd.empty):
+        vb = st.session_state.setdefault("hadiah_baru_ver", 0)
+        nama = st.text_input("Nama hadiah *", placeholder="mis. Payung Wismilak",
+                             key=f"hb_nama_{vb}").strip()
+        c1, c2 = st.columns(2)
+        harga = c1.number_input("Harga (poin) *", min_value=1, value=5000, step=100,
+                                key=f"hb_poin_{vb}")
+        tanpa_stok = c2.checkbox("Stok tanpa batas", value=False, key=f"hb_ts_{vb}")
+        stok = None if tanpa_stok else c2.number_input("Stok", min_value=0, value=10, step=1,
+                                                        key=f"hb_stok_{vb}")
+        desk = st.text_area("Deskripsi", placeholder="mis. Payung lipat ukuran besar",
+                            key=f"hb_desk_{vb}").strip()
+        cara = st.radio("Foto hadiah", ["🖼️ Galeri", "📷 Kamera"], horizontal=True,
+                        key=f"hb_cara_{vb}")
+        foto = (st.file_uploader("Pilih foto", type=["jpg", "jpeg", "png"], key=f"hb_up_{vb}")
+                if cara.startswith("🖼️") else st.camera_input("Foto hadiah", key=f"hb_cam_{vb}"))
+        if st.button("➕ Tambah Hadiah", type="primary", use_container_width=True,
+                     key=f"hb_simpan_{vb}"):
+            if not nama:
+                st.error("Nama hadiah wajib diisi.")
+            elif foto is None:
+                st.error("Tambahkan foto hadiah supaya toko tahu bentuknya.")
+            else:
+                now = now_wib()
+                tambah("Hadiah", {
+                    "nama": nama, "poin": int(harga),
+                    "stok": "" if stok is None else str(int(stok)), "deskripsi": desk,
+                    "aktif": "ya", "dibuat": now.isoformat(timespec="seconds"),
+                    "diubah_oleh": st.session_state.nama,
+                    "diubah_pada": now.isoformat(timespec="seconds"),
+                }, foto=foto, nama_foto=f"hadiah_{now:%Y%m%d_%H%M%S}")
+                st.session_state.hadiah_baru_ver = vb + 1
+                st.session_state.hadiah_admin_ok = f"✅ Hadiah {nama} ditambahkan."
+                st.rerun()
+
+
 # ================== PILIHAN IKON ==================
 IKON_PILIHAN = [
     # rokok & toko
@@ -985,7 +1230,9 @@ def saldo_toko(kode):
     t, m, p = tabel("Transaksi"), tabel("Misi"), tabel("Penukaran")
     beli = t[(t.kode_toko == kode) & (t.status == "approved")].poin.sum()
     misi = m[(m.kode_toko == kode) & (m.status == "approved")].poin.sum()
-    keluar = p[p.kode_toko == kode].poin.sum()
+    k = tabel("Klaim")
+    keluar = (p[p.kode_toko == kode].poin.sum()
+              + k[(k.kode_toko == kode) & k.status.isin(KLAIM_TERPAKAI)].poin.sum())
     return beli + misi, keluar, beli + misi - keluar
 
 
@@ -1197,12 +1444,16 @@ def lihat_foto_nota(trx, key, boleh_hapus=False):
 def sales_approval():
     st.subheader("✅ Approval dari Toko")
     n_nota, n_misi = jumlah_pending(), jumlah_pending(sheet="Misi")
-    tab_nota, tab_misi = st.tabs([f"🧾 Nota Pembelian ({n_nota})",
-                                  f"🎯 Misi Bonus ({n_misi})"])
+    n_hadiah = jumlah_pending(sheet="Klaim")
+    tab_nota, tab_misi, tab_hadiah = st.tabs([f"🧾 Nota Pembelian ({n_nota})",
+                                              f"🎯 Misi Bonus ({n_misi})",
+                                              f"🎁 Hadiah ({n_hadiah})"])
     with tab_nota:
         sales_approval_nota()
     with tab_misi:
         sales_approval_misi()
+    with tab_hadiah:
+        sales_approval_hadiah()
 
 
 def sales_approval_nota():
@@ -1454,7 +1705,10 @@ def sales_rekap():
     df["Pack"] = df.Kode.map(ta.groupby("kode_toko").jumlah_pack.sum()).fillna(0).astype(int)
     df["PoinBeli"] = df.Kode.map(ta.groupby("kode_toko").poin.sum()).fillna(0).astype(int)
     df["PoinMisi"] = df.Kode.map(ma.groupby("kode_toko").poin.sum()).fillna(0).astype(int)
-    df["PoinDitukar"] = df.Kode.map(p.groupby("kode_toko").poin.sum()).fillna(0).astype(int)
+    kl = tabel("Klaim")
+    kl = kl[kl.status.isin(KLAIM_TERPAKAI)][["kode_toko", "poin"]]
+    keluar = pd.concat([p[["kode_toko", "poin"]], kl]).groupby("kode_toko").poin.sum()
+    df["PoinDitukar"] = df.Kode.map(keluar).fillna(0).astype(int)
     df["SaldoPoin"] = df.PoinBeli + df.PoinMisi - df.PoinDitukar
     pend = pd.concat([t[t.status == "pending"].kode_toko, m[m.status == "pending"].kode_toko])
     df["Pending"] = df.Kode.map(pend.value_counts()).fillna(0).astype(int)
@@ -1971,17 +2225,17 @@ def main():
         return
     tombol_keluar()
     if role == "toko":
-        menu = pilih_menu(["Saldo Poin", "Tambah Poin", "Misi Bonus", "Profil"])
+        menu = pilih_menu(["Saldo Poin", "Tambah Poin", "Misi Bonus", "Tukar Hadiah", "Profil"])
         {"Saldo Poin": toko_saldo, "Tambah Poin": toko_tambah_poin,
-         "Misi Bonus": toko_misi, "Profil": toko_profil}[menu]()
+         "Misi Bonus": toko_misi, "Tukar Hadiah": toko_hadiah, "Profil": toko_profil}[menu]()
     else:
         if not (FOTO_SCRIPT_URL and FOTO_TOKEN):
             st.sidebar.error("📷 Penyimpanan foto belum diatur (FOTO_SCRIPT_URL / FOTO_TOKEN).")
-        n = jumlah_pending() + jumlah_pending(sheet="Misi")
+        n = jumlah_pending() + jumlah_pending(sheet="Misi") + jumlah_pending(sheet="Klaim")
         if n:
             st.sidebar.warning(f"🔔 {n} pengajuan toko menunggu approval")
         menu = pilih_menu(["Approval", "Input Nota", "Rekap Poin", "Penukaran Poin",
-                           "Daftar Toko", "Atur Program"])
+                           "Daftar Toko", "Atur Program", "Atur Hadiah"])
         {
             "Approval": sales_approval,
             "Input Nota": sales_input_nota,
@@ -1989,6 +2243,7 @@ def main():
             "Penukaran Poin": sales_penukaran,
             "Daftar Toko": sales_daftar_toko,
             "Atur Program": sales_program,
+            "Atur Hadiah": sales_hadiah,
         }[menu]()
 
 
