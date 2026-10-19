@@ -1,18 +1,24 @@
 """
 Aplikasi Poin Toko - Program Loyalitas Pembelian Rokok
-Database: Google Sheets (data) + Google Drive (foto), lewat Google Apps Script.
-Aturan: Perbanyak Beli di Sales Kami dan Kumpulkan Pointnya 
+Database: Google Sheets (data) + Google Drive (foto), langsung via Service Account.
+Aturan: 1 nota = min 1 pack, max 1 slop (10 pack). 1 pack = 100 poin.
 Jalankan: streamlit run app.py
 """
 import base64
 import hashlib
+import io
 import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import gspread
 import pandas as pd
 import requests
 import streamlit as st
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from PIL import Image
 
 WIB = ZoneInfo("Asia/Jakarta")
 
@@ -31,6 +37,17 @@ POIN_PER_PACK = 100
 MIN_PACK = 1
 MAX_PACK = 10  # 1 slop
 
+IMAGE_MAX_PX = 1920
+IMAGE_QUALITY = 75
+
+FOLDER_UTAMA = "Foto Poin Toko"
+FOLDER_MAP = {"Transaksi": "Nota Pembelian", "Misi": "Misi Bonus"}
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
 
 def secret(nama, default=None):
     try:
@@ -39,27 +56,27 @@ def secret(nama, default=None):
         return default
 
 
-SALES_PASSWORD = secret("SALES_PASSWORD", "sales123")  # GANTI di Secrets!
-API_URL = secret("GSHEET_API_URL")
-API_TOKEN = secret("GSHEET_TOKEN")
-SHEET_URL = secret("GSHEET_URL")
-GEMINI_API_KEY = secret("GEMINI_API_KEY")  # AI pembaca nota (opsional)
-GEMINI_MODEL = secret("GEMINI_MODEL", "gemini-3.6-flash")
+SALES_PASSWORD = secret("SALES_PASSWORD", "sales123")
+SHEET_ID = secret("GSHEET_ID", "")
+SHEET_URL = secret("GSHEET_URL",
+                   f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit" if SHEET_ID else "")
+GEMINI_API_KEY = secret("GEMINI_API_KEY")
+GEMINI_MODEL = secret("GEMINI_MODEL", "gemini-2.0-flash")
 
 # Misi bonus: poin per jenis, bisa diklaim 1x per minggu (Senin-Minggu) per jenis
 MISI = {
-    "eceran": {"nama": "Sedia Eceran", "ikon": "🚬", "poin": 1000},
+    "eceran":   {"nama": "Sedia Eceran",  "ikon": "🚬",  "poin": 1000},
     "sunblind": {"nama": "POSM Sunblind", "ikon": "⛱️", "poin": 1000},
-    "stiker": {"nama": "POSM Stiker", "ikon": "🏷️", "poin": 500},
+    "stiker":   {"nama": "POSM Stiker",   "ikon": "🏷️", "poin": 500},
 }
 
 STATUS_LABEL = {
-    "pending": "⏳ Menunggu approval",
+    "pending":  "⏳ Menunggu approval",
     "approved": "✅ Disetujui",
     "rejected": "❌ Ditolak",
 }
 
-# Kolom tiap sheet (harus sama dengan Code.gs)
+# Kolom tiap sheet
 COLS = {
     "Toko": ["kode_toko", "nama_toko", "pemilik", "no_hp", "alamat", "pin_hash", "dibuat"],
     "Transaksi": ["id", "kode_toko", "nama_toko", "no_nota", "tanggal", "jumlah_pack", "poin",
@@ -189,25 +206,129 @@ h1, h2, h3 { font-weight: 900 !important; letter-spacing: .2px; }
 st.markdown(TEMA_CSS, unsafe_allow_html=True)
 
 
-# ================== DATABASE: GOOGLE SHEETS ==================
-def api(action, **kw):
-    """Panggil Google Apps Script (Sheet + Drive)."""
-    r = requests.post(API_URL, json={"token": API_TOKEN, "action": action, **kw}, timeout=90)
-    try:
-        hasil = r.json()
-    except ValueError:
-        raise RuntimeError(
-            "Balasan Google tidak terbaca. Cek GSHEET_API_URL dan pastikan Web App "
-            "di-deploy dengan akses 'Anyone'."
-        )
-    if not hasil.get("ok"):
-        raise RuntimeError(hasil.get("error", "Gagal menghubungi Google Sheet"))
-    return hasil.get("data")
+# ================== AUTH & CLIENTS ==================
 
+@st.cache_resource
+def _creds():
+    info = json.loads(st.secrets["gcp_json"])
+    return Credentials.from_service_account_info(info, scopes=SCOPES)
+
+
+@st.cache_resource
+def _gc():
+    return gspread.authorize(_creds())
+
+
+@st.cache_resource
+def _drive():
+    return build("drive", "v3", credentials=_creds())
+
+
+def _wb():
+    return _gc().open_by_key(SHEET_ID)
+
+
+# ================== COMPRESS IMAGE ==================
+
+def compress_image(uploaded_file) -> bytes:
+    """Kompres gambar. Rotasi EXIF otomatis, resize max 1920px, JPEG. Auto-turun quality jika >1.5MB."""
+    raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file
+    img = Image.open(io.BytesIO(raw))
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    try:
+        import PIL.ExifTags as _et
+        exif = img._getexif()
+        if exif:
+            ori_key = next((k for k, v in _et.TAGS.items() if v == "Orientation"), None)
+            if ori_key and ori_key in exif:
+                rotate_map = {3: 180, 6: 270, 8: 90}
+                if exif[ori_key] in rotate_map:
+                    img = img.rotate(rotate_map[exif[ori_key]], expand=True)
+    except Exception:
+        pass
+    ratio = IMAGE_MAX_PX / max(img.size)
+    if ratio < 1:
+        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
+    quality = IMAGE_QUALITY
+    for _ in range(3):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        if buf.tell() <= 1_500_000 or quality <= 50:
+            break
+        quality -= 15
+    return buf.getvalue()
+
+
+# ================== DRIVE UTILS ==================
+
+@st.cache_data(ttl=86400)
+def _folder_id(subfolder: str) -> str:
+    """Cari atau buat folder Drive. Returns folder ID."""
+    drive = _drive()
+
+    def _find_or_create(name, parent_id=None):
+        q = (f"name='{name}' and mimeType='application/vnd.google-apps.folder' "
+             f"and trashed=false")
+        if parent_id:
+            q += f" and '{parent_id}' in parents"
+        res = drive.files().list(q=q, fields="files(id)").execute()
+        files = res.get("files", [])
+        if files:
+            return files[0]["id"]
+        meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
+        if parent_id:
+            meta["parents"] = [parent_id]
+        return drive.files().create(body=meta, fields="id").execute()["id"]
+
+    root_id = _find_or_create(FOLDER_UTAMA)
+    return _find_or_create(subfolder, root_id)
+
+
+def _upload_foto(data: bytes, filename: str, sheet_nama: str) -> tuple[str, str]:
+    """Upload foto ke Drive. Returns (file_id, web_view_link)."""
+    sub = FOLDER_MAP.get(sheet_nama, sheet_nama)
+    fid = _folder_id(sub)
+    drive = _drive()
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="image/jpeg", resumable=False)
+    meta = {"name": filename, "parents": [fid]}
+    f = drive.files().create(body=meta, media_body=media, fields="id,webViewLink").execute()
+    drive.permissions().create(
+        fileId=f["id"],
+        body={"role": "reader", "type": "anyone"},
+    ).execute()
+    return f["id"], f.get("webViewLink", "")
+
+
+# ================== DATABASE: GOOGLE SHEETS ==================
 
 @st.cache_data(ttl=60, show_spinner="Memuat data...")
 def _muat_semua():
-    return api("readAll")
+    wb = _wb()
+    result = {}
+    for nama, cols in COLS.items():
+        try:
+            ws = wb.worksheet(nama)
+        except gspread.WorksheetNotFound:
+            ws = wb.add_worksheet(nama, rows=1000, cols=len(cols))
+            ws.update([cols], "A1")
+            result[nama] = []
+            continue
+        rows = ws.get_all_values()
+        if len(rows) < 2:
+            # Pastikan header ada
+            if not rows:
+                ws.update([cols], "A1")
+            result[nama] = []
+            continue
+        headers = rows[0]
+        data = []
+        for r in rows[1:]:
+            if any(r):
+                pad = r + [""] * max(0, len(headers) - len(r))
+                data.append(dict(zip(headers, pad)))
+        result[nama] = data
+    return result
 
 
 def tabel(nama):
@@ -225,40 +346,115 @@ def segarkan():
     _muat_semua.clear()
 
 
-def mime_foto(b):
-    return ("image/png", "png") if b[:4] == b"\x89PNG" else ("image/jpeg", "jpg")
+def _ws_ensure(nama) -> gspread.Worksheet:
+    """Buka worksheet, buat kalau belum ada."""
+    wb = _wb()
+    try:
+        ws = wb.worksheet(nama)
+    except gspread.WorksheetNotFound:
+        ws = wb.add_worksheet(nama, rows=1000, cols=len(COLS[nama]))
+        ws.update([COLS[nama]], "A1")
+        return ws
+    # Pastikan header row benar
+    header = ws.row_values(1)
+    if header != COLS[nama]:
+        ws.update([COLS[nama]], "A1")
+    return ws
+
+
+def _next_id(ws, cols) -> str:
+    if "id" not in cols:
+        return ""
+    ki = cols.index("id") + 1
+    vals = ws.col_values(ki)[1:]  # skip header
+    ids = [int(v) for v in vals if v.isdigit()]
+    return str(max(ids) + 1) if ids else "1"
+
+
+def _cari_baris(ws, cols, key, value) -> int:
+    """Nomor baris (1-indexed), atau -1."""
+    ki = cols.index(key) + 1
+    for i, v in enumerate(ws.col_values(ki)):
+        if i == 0:
+            continue
+        if str(v) == str(value):
+            return i + 1
+    return -1
 
 
 def tambah(sheet, row, foto=None, nama_foto="foto"):
-    payload = {"sheet": sheet, "row": row}
-    if foto is not None:
-        b = foto.getvalue()
-        mime, ext = mime_foto(b)
-        payload.update(foto=base64.b64encode(b).decode(), fotoMime=mime,
-                       fotoName=f"{nama_foto}.{ext}")
     with st.spinner("Menyimpan..."):
-        hasil = api("append", **payload)
+        ws = _ws_ensure(sheet)
+        cols = COLS[sheet]
+        if "id" in cols and not row.get("id"):
+            row["id"] = _next_id(ws, cols)
+        if foto is not None:
+            data = compress_image(foto)
+            try:
+                fid, furl = _upload_foto(data, f"{nama_foto}.jpg", sheet)
+                row["foto_id"] = fid
+                row["foto_link"] = furl
+            except Exception as e:
+                st.warning(f"Foto gagal diupload ke Drive: {e}")
+        baris = []
+        for c in cols:
+            v = row.get(c, "")
+            if c in KOLOM_ANGKA and v != "":
+                try:
+                    v = int(float(v))
+                except Exception:
+                    v = ""
+            baris.append(v if v is not None else "")
+        ws.append_row(baris, value_input_option="USER_ENTERED")
     segarkan()
-    return hasil
+    return {"id": row.get("id"), "foto_id": row.get("foto_id")}
 
 
 def ubah(sheet, key, value, fields):
     with st.spinner("Menyimpan..."):
-        api("update", sheet=sheet, key=key, value=str(value), fields=fields)
+        ws = _ws_ensure(sheet)
+        cols = COLS[sheet]
+        r = _cari_baris(ws, cols, key, value)
+        if r < 0:
+            raise RuntimeError("Data tidak ditemukan")
+        for k, v in fields.items():
+            if k in cols:
+                ci = cols.index(k) + 1
+                val = int(v) if k in KOLOM_ANGKA and v != "" else str(v)
+                ws.update_cell(r, ci, val)
     segarkan()
 
 
 def hapus(sheet, key, value):
     with st.spinner("Menghapus..."):
-        api("delete", sheet=sheet, key=key, value=str(value))
+        ws = _ws_ensure(sheet)
+        cols = COLS[sheet]
+        r = _cari_baris(ws, cols, key, value)
+        if r < 0:
+            raise RuntimeError("Data tidak ditemukan")
+        if "foto_id" in cols:
+            fi = cols.index("foto_id") + 1
+            fid = ws.cell(r, fi).value
+            if fid:
+                try:
+                    _drive().files().delete(fileId=fid).execute()
+                except Exception:
+                    pass
+        ws.delete_rows(r)
     segarkan()
 
 
 @st.cache_data(ttl=3600, show_spinner="Memuat foto...")
-def ambil_foto(foto_id):
+def ambil_foto(foto_id: str):
     if not foto_id:
         return None
-    return base64.b64decode(api("foto", id=foto_id)["b64"])
+    buf = io.BytesIO()
+    request = _drive().files().get_media(fileId=foto_id)
+    dl = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    return buf.getvalue()
 
 
 def tampil_foto(foto_id):
@@ -285,7 +481,7 @@ Jika foto bukan nota atau tulisan sama sekali tidak terbaca, isi "terbaca": fals
 @st.cache_data(show_spinner=False, max_entries=200)
 def baca_nota_ai(img_bytes):
     """Kirim foto nota ke Gemini, kembalikan dict hasil bacaan."""
-    mime, _ = mime_foto(img_bytes)
+    mime = "image/png" if img_bytes[:4] == b"\x89PNG" else "image/jpeg"
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{GEMINI_MODEL}:generateContent")
     body = {
@@ -296,8 +492,7 @@ def baca_nota_ai(img_bytes):
         ]}],
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
     }
-    r = requests.post(url, json=body, headers={"x-goog-api-key": GEMINI_API_KEY},
-                      timeout=60)
+    r = requests.post(url, json=body, headers={"x-goog-api-key": GEMINI_API_KEY}, timeout=60)
     if r.status_code == 429:
         raise RuntimeError("Kuota AI sedang penuh, coba lagi sebentar.")
     r.raise_for_status()
@@ -817,11 +1012,10 @@ def toko_tambah_poin():
     if st.session_state.pop("toko_kirim_ok", None):
         st.success("Nota terkirim! Tunggu approval sales, poin akan muncul di Saldo Poin.")
 
-    v = st.session_state.setdefault("form_ver", 0)  # untuk reset form setelah kirim
+    v = st.session_state.setdefault("form_ver", 0)
 
     foto = st.camera_input("📷 Foto nota (langsung dari kamera)", key=f"cam{v}")
 
-    # --- AI membaca nota, lalu isi otomatis pack & deskripsi ---
     hasil_ai = None
     if foto is not None and GEMINI_API_KEY:
         img = foto.getvalue()
@@ -850,7 +1044,6 @@ def toko_tambah_poin():
                 else:
                     st.warning("AI tidak bisa membaca nota. Foto ulang lebih dekat dan "
                                "terang, atau isi manual.")
-            # isi otomatis sekali untuk tiap foto baru (toko tetap bisa mengubah)
             if st.session_state.get(f"ai_isi{v}") != sidik:
                 st.session_state[f"ai_isi{v}"] = sidik
                 if hasil_ai["total_pack"] > 0:
@@ -934,7 +1127,7 @@ def kartu_misi(kode, jenis, minta_brand=False):
             if minta_brand and not brand:
                 st.error("Tulis brand rokok yang diecer.")
                 return
-            segarkan()  # cek ulang supaya tidak dobel
+            segarkan()
             if status_misi_minggu_ini(kode, jenis):
                 st.rerun()
             mg, _ = minggu_ini()
@@ -973,22 +1166,30 @@ def toko_misi():
 
 # ================== ROUTER ==================
 def halaman_belum_setup():
-    st.error("Database Google Sheet belum terhubung.")
+    st.error("Secrets belum dikonfigurasi.")
     st.markdown(
         "Isi **Settings → Secrets** di Streamlit Cloud dengan:\n\n"
         "```toml\n"
         'SALES_PASSWORD = "password-sales"\n'
-        'GSHEET_API_URL = "https://script.google.com/macros/s/.../exec"\n'
-        'GSHEET_TOKEN = "token-yang-sama-dengan-di-Code.gs"\n'
-        'GSHEET_URL = "https://docs.google.com/spreadsheets/d/..."\n'
+        'GSHEET_ID = "spreadsheet-id-dari-url"\n'
+        'GSHEET_URL = "https://docs.google.com/spreadsheets/d/.../edit"\n'
+        'GEMINI_API_KEY = "AIza..."  # opsional\n\n'
+        '[gcp_json]\n'
+        '# Paste isi JSON service account di sini (lihat README)\n'
         "```"
     )
 
 
 def main():
-    if not (API_URL and API_TOKEN):
+    if not SHEET_ID:
         halaman_belum_setup()
         return
+    try:
+        _creds()
+    except Exception:
+        halaman_belum_setup()
+        return
+
     role = st.session_state.get("role")
     if not role:
         halaman_login()
@@ -1017,8 +1218,8 @@ def main():
 
 try:
     main()
-except (RuntimeError, requests.RequestException) as e:
-    st.error(f"Gagal terhubung ke Google Sheet: {e}")
+except Exception as e:
+    st.error(f"Terjadi kesalahan: {e}")
     if st.button("Coba lagi"):
         segarkan()
         st.rerun()
