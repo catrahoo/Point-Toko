@@ -498,7 +498,7 @@ def tambah(sheet, row, foto=None, nama_foto="foto"):
                 except Exception:
                     v = ""
             baris.append(v if v is not None else "")
-        ws.append_row(baris, value_input_option="USER_ENTERED")
+        ws.append_row(baris, value_input_option="RAW")  # RAW: angka 0 di depan (no HP, kode) tidak hilang
     segarkan()
     return {"id": row.get("id"), "foto_id": row.get("foto_id")}
 
@@ -914,43 +914,85 @@ def sales_input_nota():
 
 def sales_daftar_toko():
     st.subheader("🏬 Daftar Toko Baru")
-    with st.form("form_toko", clear_on_submit=True):
-        kode = st.text_input("Kode Toko (unik, mis. TK001)").strip().upper()
-        nama = st.text_input("Nama Toko").strip()
-        pemilik = st.text_input("Nama Pemilik").strip()
-        hp = st.text_input("No. HP").strip()
-        alamat = st.text_area("Alamat").strip()
-        pin = st.text_input("PIN untuk login toko (min 4 angka)", type="password")
-        if st.form_submit_button("Daftarkan", use_container_width=True):
-            if not (kode and nama and len(pin) >= 4):
-                st.error("Kode, nama toko, dan PIN (min 4 karakter) wajib diisi.")
-            elif (tabel("Toko").kode_toko == kode).any():
-                st.error("Kode toko sudah dipakai.")
-            else:
-                tambah("Toko", {
-                    "kode_toko": kode, "nama_toko": nama, "pemilik": pemilik,
-                    "no_hp": hp, "alamat": alamat, "pin_hash": hash_pin(pin),
-                    "dibuat": now_wib().isoformat(timespec="seconds"),
-                })
-                st.success(f"Toko {nama} terdaftar. Kode: {kode}")
+    st.caption("Pilih customer dari master. Login toko: username buatan Anda + "
+               "password = Customer No.")
+    if msg := st.session_state.pop("daftar_ok", None):
+        st.success(msg)
+
+    try:
+        cust = load_customers()
+    except Exception as e:
+        st.error(f"Master customer tidak bisa dibaca: {e}")
+        st.caption("Pastikan Customer Sheet di-share (Viewer) ke client_email service account.")
+        return
+
+    t = daftar_toko()
+    terdaftar = set(t.kode_toko.str.strip().str.upper())
+    belum = cust[~cust.kode.str.upper().isin(terdaftar)]
+    st.caption(f"{len(cust):,} customer aktif · {len(belum):,} belum terdaftar".replace(",", "."))
+
+    pilih = st.selectbox(
+        "🔍 Cari Customer * (ketik kode customer atau nama toko)",
+        ["— Pilih —"] + belum.label.tolist(), key="dt_cust",
+    )
+    if pilih != "— Pilih —":
+        c = belum[belum.label == pilih].iloc[0]
+        st.info(f"**{c.nama}** ({c.kode})"
+                + (f"\n\n{c.alamat}" if c.alamat else "")
+                + (f"\n\n{' - '.join(x for x in (c.zona, c.rayon) if x)}"
+                   if (c.zona or c.rayon) else ""))
+        with st.form("form_toko", clear_on_submit=True):
+            username = st.text_input(
+                "Username *", placeholder="mis. no. HP, gmail, atau nama singkat"
+            ).strip().lower()
+            pemilik = st.text_input("Nama Pemilik").strip()
+            hp = st.text_input("No. HP Aktif *", placeholder="mis. 081234567890").strip()
+            st.caption(f"Password toko otomatis = Customer No. **{c.kode}**")
+            if st.form_submit_button("Daftarkan", use_container_width=True):
+                hp_bersih = re.sub(r"\D", "", hp)
+                if hp_bersih.startswith("62"):
+                    hp_bersih = "0" + hp_bersih[2:]
+                if not username or " " in username:
+                    st.error("Username wajib diisi dan tanpa spasi.")
+                elif not re.fullmatch(r"08\d{8,11}", hp_bersih):
+                    st.error("No. HP aktif wajib diisi, format 08xxxxxxxxxx (10-13 digit).")
+                elif (t.username.str.strip().str.lower() == username).any():
+                    st.error("Username sudah dipakai toko lain.")
+                else:
+                    tambah("Toko", {
+                        "kode_toko": c.kode.upper(), "nama_toko": c.nama, "pemilik": pemilik,
+                        "no_hp": hp_bersih, "alamat": c.alamat, "pin_hash": hash_pin(c.kode.upper()),
+                        "dibuat": now_wib().isoformat(timespec="seconds"),
+                        "username": username, "zona": c.zona, "rayon": c.rayon,
+                    })
+                    st.session_state.daftar_ok = (f"Toko {c.nama} terdaftar. Username: "
+                                                  f"{username} · Password: {c.kode}")
+                    st.session_state.pop("dt_cust", None)
+                    st.rerun()
 
     st.divider()
     st.write("**Toko terdaftar**")
-    t = daftar_toko()
     st.dataframe(
-        t[["kode_toko", "nama_toko", "pemilik", "no_hp", "alamat"]].rename(columns={
-            "kode_toko": "Kode", "nama_toko": "Toko", "pemilik": "Pemilik",
-            "no_hp": "HP", "alamat": "Alamat"}),
+        t[["kode_toko", "nama_toko", "username", "zona", "rayon", "no_hp", "alamat"]].rename(
+            columns={"kode_toko": "Customer No", "nama_toko": "Toko", "username": "Username",
+                     "zona": "Zona", "rayon": "Rayon", "no_hp": "HP", "alamat": "Alamat"}),
         hide_index=True, use_container_width=True,
     )
 
-    with st.expander("🔑 Reset PIN toko"):
+    with st.expander("✏️ Ubah username toko"):
         if not t.empty:
-            k = st.selectbox("Pilih toko", t.kode_toko, key="reset_kode")
-            pin_baru = st.text_input("PIN baru", type="password", key="pin_baru")
-            if st.button("Reset PIN") and len(pin_baru) >= 4:
-                ubah("Toko", "kode_toko", k, {"pin_hash": hash_pin(pin_baru)})
-                st.success("PIN diperbarui.")
+            opsi = {f"{r.nama_toko} ({r.kode_toko}) · {r.username or '-'}": r.kode_toko
+                    for r in t.itertuples()}
+            k = opsi[st.selectbox("Pilih toko", list(opsi.keys()), key="ubah_user_kode")]
+            baru = st.text_input("Username baru", key="user_baru").strip().lower()
+            if st.button("Simpan username"):
+                if not baru or " " in baru:
+                    st.error("Username wajib diisi dan tanpa spasi.")
+                elif ((t.username.str.strip().str.lower() == baru) & (t.kode_toko != k)).any():
+                    st.error("Username sudah dipakai toko lain.")
+                else:
+                    ubah("Toko", "kode_toko", k, {"username": baru})
+                    st.success("Username diperbarui.")
 
 
 def sales_rekap():
