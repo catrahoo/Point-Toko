@@ -76,6 +76,8 @@ def _ambil_sheet_id(teks):
 
 # Akun login sales (dikunci di kode)
 SALES_AKUN = {"spv-sby": "sales123"}
+# Akun promotor (pengantar hadiah, dikunci di kode)
+PROMOTOR_AKUN = {"promotor.sby": "promotor123"}
 SHEET_URL_DEFAULT = ("https://docs.google.com/spreadsheets/d/"
                      "1g5cHM2J00thNe-PpfeycufhHLPkpIXV8msewhm_Pf8I/edit")
 SHEET_URL = str(secret("GSHEET_URL", "") or "").strip() or SHEET_URL_DEFAULT
@@ -1072,8 +1074,8 @@ def toko_hadiah():
             "Catatan": riwayat.catatan}), hide_index=True, use_container_width=True)
         siap = riwayat[riwayat.status == "approved"]
         for _, r in siap.iterrows():
-            st.info(f"🎁 **{r.nama_hadiah}** siap diserahkan. Tunjukkan kode ini ke SPV saat "
-                    f"menerima hadiah: **{r.kode_klaim or '-'}**")
+            st.info(f"🎁 **{r.nama_hadiah}** sudah disetujui dan akan segera diserahkan oleh SPV "
+                    f"(kode: {r.kode_klaim or '-'}).")
         st.caption("Jika pengajuan ditolak, poin otomatis kembali ke saldo Anda.")
 
 
@@ -1114,7 +1116,16 @@ def sales_approval_hadiah():
                     st.toast(f"Ditolak, {poin(r.poin)} kembali ke {r.nama_toko}")
                     st.rerun()
 
+    daftar_serah(k)
+
+
+def daftar_serah(k):
+    """Daftar hadiah disetujui yang menunggu diantar + form bukti serah (SPV & promotor)."""
     siap = k[k.status == "approved"].sort_values("diproses_pada")
+    if siap.empty:
+        if st.session_state.get("role") == "promotor":
+            st.success("Tidak ada hadiah yang perlu diantar saat ini. 👍")
+        return
     if not siap.empty:
         st.markdown("### 📦 Menunggu diserahkan ke toko")
         for _, r in siap.iterrows():
@@ -1131,10 +1142,7 @@ def sales_approval_hadiah():
                         st.session_state.serah_buka = r.id
                         st.rerun()
                     continue
-                st.caption("Minta toko membuka menu **Tukar Hadiah** dan menunjukkan kode "
-                           "hadiahnya.")
-                kode_input = st.text_input("Kode dari HP toko *", key=f"sk{r.id}",
-                                           placeholder="HDH-xxxxxx-XXXX").strip().upper()
+                st.caption(f"Kode hadiah: **{kode_k}**")
                 penerima = st.text_input("Nama penerima *", key=f"sn{r.id}").strip()
                 foto = ambil_foto_langsung(f"serah_{r.id}",
                                            "📷 Foto penerima bersama hadiah")
@@ -1144,10 +1152,7 @@ def sales_approval_hadiah():
                     st.rerun()
                 if b1.button("✅ Konfirmasi diserahkan", key=f"sok{r.id}", type="primary",
                              use_container_width=True):
-                    if kode_input != kode_k:
-                        st.error("Kode tidak cocok. Pastikan toko menunjukkan kode hadiah "
-                                 "yang benar.")
-                    elif not penerima:
+                    if not penerima:
                         st.error("Isi nama penerima.")
                     elif foto is None:
                         st.error("Ambil foto penerima bersama hadiah.")
@@ -1165,6 +1170,36 @@ def sales_approval_hadiah():
                         st.session_state.pop("serah_buka", None)
                         st.toast(f"📦 {kode_k} diserahkan ke {penerima}")
                         st.rerun()
+
+
+def promotor_kirim():
+    st.subheader("🚚 Kirim Reward ke Toko")
+    st.caption("Antar hadiah ke toko, lalu isi nama penerima dan foto penerima bersama hadiah.")
+    toko = tabel("Toko")[["kode_toko", "alamat", "no_hp"]]
+    k = tabel("Klaim")
+    siap = k[k.status == "approved"]
+    if not siap.empty:
+        info = siap.merge(toko, on="kode_toko", how="left").fillna("")
+        st.dataframe(pd.DataFrame({
+            "Kode": info.kode_klaim, "Toko": info.nama_toko, "Hadiah": info.nama_hadiah,
+            "Alamat": info.alamat, "HP": info.no_hp}), hide_index=True, use_container_width=True)
+    daftar_serah(k)
+
+
+def promotor_riwayat():
+    st.subheader("📋 Riwayat Antar Saya")
+    k = tabel("Klaim")
+    k = k[(k.status == "diserahkan") & (k.diserahkan_oleh == st.session_state.nama)]
+    if k.empty:
+        st.info("Belum ada hadiah yang Anda antar.")
+        return
+    k = k.sort_values("diserahkan_pada", ascending=False)
+    st.dataframe(pd.DataFrame({
+        "Kode": k.kode_klaim, "Toko": k.nama_toko, "Hadiah": k.nama_hadiah,
+        "Penerima": k.nama_penerima, "Diserahkan": k.diserahkan_pada.map(waktu)}),
+        hide_index=True, use_container_width=True)
+    opsi = {f"{r.kode_klaim} · {r.nama_toko}": r.foto_serah_id for r in k.itertuples()}
+    tampil_foto(opsi[st.selectbox("Lihat foto bukti", list(opsi.keys()), key="prom_foto")])
 
 
 def sales_riwayat_hadiah():
@@ -1455,6 +1490,8 @@ def pulihkan_sesi():
         return
     if role == "sales" and ident in SALES_AKUN:
         st.session_state.update(role="sales", nama=ident)
+    elif role == "promotor" and ident in PROMOTOR_AKUN:
+        st.session_state.update(role="promotor", nama=ident)
     elif role == "toko":
         t = tabel("Toko")
         r = t[t.kode_toko == ident]
@@ -1481,33 +1518,28 @@ def halaman_login():
             </div>""",
         unsafe_allow_html=True,
     )
-    tab_toko, tab_sales = st.tabs(["🏪 Masuk sebagai Toko", "🧑‍💼 Masuk sebagai Sales"])
-
-    with tab_toko:
-        with st.form("login_toko"):
-            user = st.text_input("Username").strip().lower()
-            pw = st.text_input("Password (Customer No.)", type="password").strip().upper()
-            if st.form_submit_button("Masuk", use_container_width=True):
+    with st.form("login"):
+        user = st.text_input("Username").strip().lower()
+        pw = st.text_input("Password", type="password").strip()
+        st.caption("Untuk toko: password = Customer No.")
+        if st.form_submit_button("Masuk", use_container_width=True):
+            if user in SALES_AKUN and pw == SALES_AKUN[user]:
+                st.session_state.update(role="sales", nama=user)
+                buat_sesi("sales", user)
+                st.rerun()
+            elif user in PROMOTOR_AKUN and pw == PROMOTOR_AKUN[user]:
+                st.session_state.update(role="promotor", nama=user)
+                buat_sesi("promotor", user)
+                st.rerun()
+            else:
                 segarkan()
                 t = tabel("Toko")
                 r = t[(t.username.str.strip().str.lower() == user)
-                      & (t.kode_toko.str.strip().str.upper() == pw)]
+                      & (t.kode_toko.str.strip().str.upper() == pw.upper())]
                 if user and pw and len(r):
                     st.session_state.update(role="toko", kode_toko=r.kode_toko.iloc[0],
                                             nama=r.nama_toko.iloc[0])
                     buat_sesi("toko", r.kode_toko.iloc[0])
-                    st.rerun()
-                else:
-                    st.error("Username atau password salah.")
-
-    with tab_sales:
-        with st.form("login_sales"):
-            nama = st.text_input("Username").strip().lower()
-            pw = st.text_input("Password", type="password")
-            if st.form_submit_button("Masuk", use_container_width=True):
-                if nama in SALES_AKUN and pw == SALES_AKUN[nama]:
-                    st.session_state.update(role="sales", nama=nama)
-                    buat_sesi("sales", nama)
                     st.rerun()
                 else:
                     st.error("Username atau password salah.")
@@ -1765,6 +1797,8 @@ def sales_daftar_toko():
                     st.error("Username wajib diisi dan tanpa spasi.")
                 elif not re.fullmatch(r"08\d{8,11}", hp_bersih):
                     st.error("No. HP aktif wajib diisi, format 08xxxxxxxxxx (10-13 digit).")
+                elif username in SALES_AKUN or username in PROMOTOR_AKUN:
+                    st.error("Username itu dipakai akun SPV/promotor. Pilih username lain.")
                 elif (t.username.str.strip().str.lower() == username).any():
                     st.error("Username sudah dipakai toko lain.")
                 else:
@@ -2338,7 +2372,10 @@ def main():
         halaman_login()
         return
     tombol_keluar()
-    if role == "toko":
+    if role == "promotor":
+        menu = pilih_menu(["Kirim Reward", "Riwayat Antar"])
+        {"Kirim Reward": promotor_kirim, "Riwayat Antar": promotor_riwayat}[menu]()
+    elif role == "toko":
         menu = pilih_menu(["Saldo Poin", "Tambah Poin", "Misi Bonus", "Tukar Hadiah", "Profil"])
         {"Saldo Poin": toko_saldo, "Tambah Poin": toko_tambah_poin,
          "Misi Bonus": toko_misi, "Tukar Hadiah": toko_hadiah, "Profil": toko_profil}[menu]()
