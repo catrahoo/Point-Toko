@@ -1,7 +1,7 @@
 """
 Aplikasi Poin Toko - Program Loyalitas Pembelian Rokok
 Database: Google Sheets (data) + Google Drive (foto), lewat Google Apps Script.
-Aturan: 1 nota = min 1 pack, max 1 slop (10 pack). 1 pack = 100 poin.
+Aturan: Perbanyak Beli di Sales Kami dan Kumpulkan Pointnya 
 Jalankan: streamlit run app.py
 """
 import base64
