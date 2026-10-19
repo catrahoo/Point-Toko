@@ -80,6 +80,9 @@ if not SHEET_URL and SHEET_ID:
     SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 GEMINI_API_KEY = secret("GEMINI_API_KEY")
 GEMINI_MODEL = secret("GEMINI_MODEL", "gemini-2.0-flash")
+# Master customer (sama dengan app Cek Koordinat), hanya dibaca
+CUSTOMER_SHEET_ID = _ambil_sheet_id(
+    secret("CUSTOMER_SHEET_ID", "113E5fKvZ0wWloSbQ9IQo8QiCOz5C3zlJr28012PbXz4"))
 
 # Misi bonus: poin per jenis, bisa diklaim 1x per minggu (Senin-Minggu) per jenis
 MISI = {
@@ -96,7 +99,8 @@ STATUS_LABEL = {
 
 # Kolom tiap sheet
 COLS = {
-    "Toko": ["kode_toko", "nama_toko", "pemilik", "no_hp", "alamat", "pin_hash", "dibuat"],
+    "Toko": ["kode_toko", "nama_toko", "pemilik", "no_hp", "alamat", "pin_hash", "dibuat",
+             "username", "zona", "rayon"],
     "Transaksi": ["id", "kode_toko", "nama_toko", "no_nota", "tanggal", "jumlah_pack", "poin",
                   "status", "sumber", "deskripsi", "catatan", "sales", "diproses_oleh",
                   "diproses_pada", "dibuat", "foto_id", "foto_link", "ai_pack", "ai_baca"],
@@ -253,6 +257,68 @@ def _drive():
 
 def _wb():
     return _gc().open_by_key(SHEET_ID)
+
+
+# ================== MASTER CUSTOMER ==================
+def _with_prefix(val, prefix):
+    v = str(val).strip()
+    if not v or v.lower() in ("nan", "none", "-"):
+        return ""
+    return v.upper() if v.upper().startswith(prefix) else f"{prefix} {v.upper()}"
+
+
+def _cari_kolom(cols, *kandidat, exact=()):
+    """Cari kolom: dulu yang namanya persis sama, lalu yang mengandung kata kunci."""
+    norm = {c: c.lower().replace(" ", "").replace("_", "") for c in cols}
+    for e in exact:
+        for c, n in norm.items():
+            if n == e:
+                return c
+    for k in kandidat:
+        for c, n in norm.items():
+            if k in n:
+                return c
+    return None
+
+
+@st.cache_data(ttl=600, show_spinner="Memuat master customer...")
+def load_customers():
+    """Customer aktif dari master sheet: kode, nama, alamat, zona, rayon, label."""
+    ws = _gc().open_by_key(CUSTOMER_SHEET_ID).sheet1
+    rows = ws.get_all_values()
+    if not rows:
+        return pd.DataFrame(columns=["kode", "nama", "alamat", "zona", "rayon", "label"])
+    headers = [str(h).strip() for h in rows[0]]
+    df = pd.DataFrame(rows[1:], columns=headers)
+    cols = df.columns.tolist()
+    code_col = _cari_kolom(cols, "customerno", "kode", exact=("customerno", "kode")) or cols[0]
+    name_col = _cari_kolom(cols, "nama", "toko", exact=("customer", "namatoko", "nama")) or cols[0]
+    addr_col = _cari_kolom(cols, "alamat", "address")
+    group_col = _cari_kolom(cols, "salesgroup")
+    district_col = _cari_kolom(cols, "salesdistrict")
+    status_col = _cari_kolom(cols, exact=("status",))
+
+    if status_col:
+        df = df[df[status_col].str.strip().str.lower() == "aktif"]
+
+    out = pd.DataFrame({
+        "kode": df[code_col].astype(str).str.strip(),
+        "nama": df[name_col].astype(str).str.strip(),
+        "alamat": df[addr_col].astype(str).str.strip() if addr_col else "",
+        "zona": df[district_col].map(lambda v: _with_prefix(v, "ZONA")) if district_col else "",
+        "rayon": df[group_col].map(lambda v: _with_prefix(v, "RAYON")) if group_col else "",
+    })
+    out = out[out.kode != ""].drop_duplicates("kode")
+
+    def label(r):
+        s = f"{r.nama} ({r.kode})"
+        if r.alamat:
+            s += f" — {r.alamat[:40]}"
+        extra = " - ".join(x for x in (r.zona, r.rayon) if x)
+        return s + (f" -- {extra}" if extra else "")
+
+    out["label"] = out.apply(label, axis=1)
+    return out.sort_values("nama").reset_index(drop=True)
 
 
 # ================== COMPRESS IMAGE ==================
@@ -616,7 +682,7 @@ def halaman_login():
     st.markdown(
         f"""<div class="logo-wrap">
               <div class="logo"><b>POIN</b><i>toko</i></div>
-              <div class="logo-sub">Ayo Belanja Dan Kumpulkan Poinnya!</div>
+              <div class="logo-sub">Setiap 1 pack = {POIN_PER_PACK} poin 🎁</div>
             </div>""",
         unsafe_allow_html=True,
     )
@@ -624,18 +690,19 @@ def halaman_login():
 
     with tab_toko:
         with st.form("login_toko"):
-            kode = st.text_input("Kode Toko").strip().upper()
-            pin = st.text_input("PIN", type="password")
+            user = st.text_input("Username").strip().lower()
+            pw = st.text_input("Password (Customer No.)", type="password").strip().upper()
             if st.form_submit_button("Masuk", use_container_width=True):
                 segarkan()
                 t = tabel("Toko")
-                r = t[t.kode_toko == kode]
-                if len(r) and r.pin_hash.iloc[0] == hash_pin(pin):
-                    st.session_state.update(role="toko", kode_toko=kode,
+                r = t[(t.username.str.strip().str.lower() == user)
+                      & (t.kode_toko.str.strip().str.upper() == pw)]
+                if user and pw and len(r):
+                    st.session_state.update(role="toko", kode_toko=r.kode_toko.iloc[0],
                                             nama=r.nama_toko.iloc[0])
                     st.rerun()
                 else:
-                    st.error("Kode toko atau PIN salah.")
+                    st.error("Username atau password salah.")
 
     with tab_sales:
         with st.form("login_sales"):
