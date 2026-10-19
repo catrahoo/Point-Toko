@@ -210,7 +210,13 @@ st.markdown(TEMA_CSS, unsafe_allow_html=True)
 
 @st.cache_resource
 def _creds():
-    info = json.loads(st.secrets["gcp_json"])
+    raw = st.secrets["gcp_json"]
+    # Streamlit bisa membaca gcp_json sebagai dict (TOML table) atau string
+    if isinstance(raw, str):
+        info = json.loads(raw)
+    else:
+        # AttrDict / dict dari TOML table — konversi ke dict biasa
+        info = dict(raw)
     return Credentials.from_service_account_info(info, scopes=SCOPES)
 
 
@@ -1186,8 +1192,13 @@ def main():
         return
     try:
         _creds()
-    except Exception:
-        halaman_belum_setup()
+    except KeyError as e:
+        st.error(f"Secret tidak ditemukan: {e}")
+        st.caption("Pastikan nama secret sudah benar di Streamlit Cloud → Settings → Secrets.")
+        return
+    except Exception as e:
+        st.error(f"Gagal membaca credentials: {e}")
+        st.caption("Cek format gcp_json di Secrets — harus berupa JSON service account yang valid.")
         return
 
     role = st.session_state.get("role")
