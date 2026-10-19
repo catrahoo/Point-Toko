@@ -8,6 +8,7 @@ import base64
 import hashlib
 import io
 import json
+import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -50,16 +51,33 @@ SCOPES = [
 
 
 def secret(nama, default=None):
+    """Ambil secret. Juga dicari di dalam [gcp_json], karena di TOML semua baris
+    yang ditulis DI BAWAH [gcp_json] otomatis ikut masuk ke tabel itu."""
     try:
-        return st.secrets[nama]
+        if nama in st.secrets:
+            return st.secrets[nama]
+        g = st.secrets.get("gcp_json")
+        if hasattr(g, "get") and nama in g:
+            return g[nama]
     except Exception:
-        return default
+        pass
+    return default
+
+
+def _ambil_sheet_id(teks):
+    """Terima ID polos atau URL lengkap spreadsheet."""
+    teks = str(teks or "").strip()
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", teks)
+    return m.group(1) if m else teks
 
 
 SALES_PASSWORD = secret("SALES_PASSWORD", "sales123")
-SHEET_ID = secret("GSHEET_ID", "")
-SHEET_URL = secret("GSHEET_URL",
-                   f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit" if SHEET_ID else "")
+SHEET_URL_DEFAULT = ("https://docs.google.com/spreadsheets/d/"
+                     "1RC7v1fGmcz-9q4VowhBnf767P2N_ptonqlKuRSug0Ko/edit")
+SHEET_URL = str(secret("GSHEET_URL", "") or "").strip() or SHEET_URL_DEFAULT
+SHEET_ID = _ambil_sheet_id(secret("GSHEET_ID", "")) or _ambil_sheet_id(SHEET_URL)
+if not SHEET_URL and SHEET_ID:
+    SHEET_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
 GEMINI_API_KEY = secret("GEMINI_API_KEY")
 GEMINI_MODEL = secret("GEMINI_MODEL", "gemini-2.0-flash")
 
@@ -215,8 +233,11 @@ def _creds():
     if isinstance(raw, str):
         info = json.loads(raw)
     else:
-        # AttrDict / dict dari TOML table — konversi ke dict biasa
-        info = dict(raw)
+        # AttrDict / dict dari TOML table — konversi ke dict biasa,
+        # buang key aplikasi (huruf besar) yang mungkin ikut masuk ke tabel
+        info = {k: v for k, v in dict(raw).items() if not k.isupper()}
+    if "private_key" in info:
+        info["private_key"] = info["private_key"].replace("\\n", "\n")
     return Credentials.from_service_account_info(info, scopes=SCOPES)
 
 
@@ -1172,7 +1193,18 @@ def toko_misi():
 
 # ================== ROUTER ==================
 def halaman_belum_setup():
-    st.error("Secrets belum dikonfigurasi.")
+    st.error("Secrets belum dikonfigurasi: GSHEET_ID / GSHEET_URL tidak ditemukan.")
+    try:
+        atas = sorted(st.secrets.keys())
+        g = st.secrets.get("gcp_json")
+        dalam = sorted(g.keys()) if hasattr(g, "keys") else []
+    except Exception:
+        atas, dalam = [], []
+    st.write(f"**Secret yang terbaca:** {', '.join(atas) or '(kosong)'}")
+    if dalam:
+        st.write(f"**Isi [gcp_json]:** {', '.join(dalam)}")
+    st.info("Tulis SALES_PASSWORD, GSHEET_ID, GSHEET_URL, GEMINI_API_KEY di PALING ATAS, "
+            "sebelum baris [gcp_json].")
     st.markdown(
         "Isi **Settings → Secrets** di Streamlit Cloud dengan:\n\n"
         "```toml\n"
