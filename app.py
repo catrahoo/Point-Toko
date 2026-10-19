@@ -1779,36 +1779,40 @@ def sales_program():
         except ValueError:
             return None
 
-    with st.form(f"form_edit_{kode_p}"):
-        nama = st.text_input("Nama program *", value=p["nama"]).strip()
+    k = kode_p  # akhiran key widget, supaya isian reset saat ganti program
+    with st.container(border=True):
+        nama = st.text_input("Nama program *", value=p["nama"], key=f"e_nama_{k}").strip()
         ikon = pilih_ikon(f"ikon_edit_{kode_p}", p["ikon"] or "📌")
         c3, c4 = st.columns(2)
         jml = c3.number_input("Poin per klaim *" if misi else "Poin per pack *",
-                              min_value=1, value=max(int(p["poin"]), 1), step=50 if misi else 10)
-        aktif = c4.toggle("Program aktif", value=p["aktif"] == "ya")
+                              min_value=1, value=max(int(p["poin"]), 1), step=50 if misi else 10,
+                              key=f"e_poin_{k}")
+        aktif = c4.toggle("Program aktif", value=p["aktif"] == "ya", key=f"e_aktif_{k}")
         frek = p["frekuensi"]
         if misi:
             frek = st.selectbox("Batas klaim per toko", list(FREKUENSI),
                                 index=list(FREKUENSI).index(p["frekuensi"]),
-                                format_func=FREKUENSI.get)
+                                format_func=FREKUENSI.get, key=f"e_frek_{k}")
         c5, c6 = st.columns(2)
-        # Kotak centang "tanpa batas": menghapus tanggal di kalender tidak bisa di Streamlit
-        mulai = c5.date_input("Tanggal mulai", value=ke_tgl(p["mulai"]) or today_wib(),
-                              format="DD-MM-YYYY")
+        # Centang "tanpa batas" -> kolom tanggal disembunyikan
         tanpa_mulai = c5.checkbox("Tanpa tanggal mulai (langsung berlaku)",
-                                  value=not p["mulai"])
-        selesai = c6.date_input("Tanggal selesai", value=ke_tgl(p["selesai"]) or today_wib(),
-                                format="DD-MM-YYYY")
+                                  value=not p["mulai"], key=f"e_tm_{k}")
+        mulai = None if tanpa_mulai else c5.date_input(
+            "Tanggal mulai", value=ke_tgl(p["mulai"]) or today_wib(), format="DD-MM-YYYY",
+            key=f"e_mulai_{k}")
         tanpa_selesai = c6.checkbox("Tanpa tanggal selesai (berlaku terus)",
-                                    value=not p["selesai"])
-        mulai = None if tanpa_mulai else mulai
-        selesai = None if tanpa_selesai else selesai
+                                    value=not p["selesai"], key=f"e_ts_{k}")
+        selesai = None if tanpa_selesai else c6.date_input(
+            "Tanggal selesai", value=ke_tgl(p["selesai"]) or today_wib(), format="DD-MM-YYYY",
+            key=f"e_selesai_{k}")
         ket = st.text_input("Isian wajib untuk toko (kosongkan jika cukup foto)",
-                            value=p["keterangan"], disabled=not misi,
+                            value=p["keterangan"], key=f"e_ket_{k}",
                             placeholder="mis. Brand rokok yang diecer").strip() if misi else ""
-        desk = st.text_area("Petunjuk / deskripsi", value=p["deskripsi"]).strip()
+        desk = st.text_area("Petunjuk / deskripsi", value=p["deskripsi"],
+                            key=f"e_desk_{k}").strip()
         st.caption(f"Terakhir diubah: {p['diubah_oleh'] or '-'} · {waktu(p['diubah_pada']) or '-'}")
-        if st.form_submit_button("💾 Simpan perubahan", type="primary", use_container_width=True):
+        if st.button("💾 Simpan perubahan", type="primary", use_container_width=True,
+                     key=f"e_simpan_{k}"):
             if not nama:
                 st.error("Nama program wajib diisi.")
             elif mulai and selesai and mulai > selesai:
@@ -1843,39 +1847,51 @@ def sales_program():
                 st.rerun()
 
     with st.expander("➕ Tambah misi foto baru"):
-        with st.form("form_misi_baru", clear_on_submit=True):
-            nama = st.text_input("Nama misi *", placeholder="mis. POSM Poster").strip()
-            ikon = pilih_ikon("ikon_baru", "📌")
-            jml = st.number_input("Poin per klaim *", min_value=1, value=500, step=50)
+        if msg := st.session_state.pop("misi_baru_ok", None):
+            st.success(msg)
+        vb = st.session_state.setdefault("misi_baru_ver", 0)  # naik -> isian kosong lagi
+        with st.container(border=True):
+            nama = st.text_input("Nama misi *", placeholder="mis. POSM Poster",
+                                 key=f"b_nama_{vb}").strip()
+            ikon = pilih_ikon(f"ikon_baru_{vb}", "📌")
+            jml = st.number_input("Poin per klaim *", min_value=1, value=500, step=50,
+                                  key=f"b_poin_{vb}")
             frek_baru = st.selectbox("Batas klaim per toko", list(FREKUENSI), index=1,
-                                     format_func=FREKUENSI.get)
+                                     format_func=FREKUENSI.get, key=f"b_frek_{vb}")
             c1, c2 = st.columns(2)
-            mulai = c1.date_input("Mulai", value=today_wib(), format="DD-MM-YYYY")
-            selesai = c2.date_input("Selesai", value=today_wib(), format="DD-MM-YYYY")
-            tanpa_selesai = c2.checkbox("Tanpa tanggal selesai (berlaku terus)", value=True)
-            selesai = None if tanpa_selesai else selesai
-            ket = st.text_input("Isian wajib (opsional)",
-                                placeholder="mis. Brand rokok yang diecer").strip()
-            desk = st.text_input("Petunjuk foto",
-                                 placeholder="mis. Foto poster kami yang terpasang").strip()
-            if st.form_submit_button("Tambah Misi", use_container_width=True):
+            tanpa_mulai = c1.checkbox("Tanpa tanggal mulai (langsung berlaku)", value=False,
+                                      key=f"b_tm_{vb}")
+            mulai = None if tanpa_mulai else c1.date_input(
+                "Tanggal mulai", value=today_wib(), format="DD-MM-YYYY", key=f"b_mulai_{vb}")
+            tanpa_selesai = c2.checkbox("Tanpa tanggal selesai (berlaku terus)", value=True,
+                                        key=f"b_ts_{vb}")
+            selesai = None if tanpa_selesai else c2.date_input(
+                "Tanggal selesai", value=today_wib(), format="DD-MM-YYYY", key=f"b_selesai_{vb}")
+            ket = st.text_input("Isian wajib (opsional)", placeholder="mis. Brand rokok yang diecer",
+                                key=f"b_ket_{vb}").strip()
+            desk = st.text_input("Petunjuk foto", placeholder="mis. Foto poster kami yang terpasang",
+                                 key=f"b_desk_{vb}").strip()
+            if st.button("Tambah Misi", use_container_width=True, key=f"b_simpan_{vb}"):
                 kode_baru = re.sub(r"[^a-z0-9]+", "_", nama.lower()).strip("_")
                 if not kode_baru:
                     st.error("Nama misi wajib diisi.")
                 elif kode_baru in set(df.kode):
                     st.error("Misi dengan nama itu sudah ada.")
-                elif selesai and selesai < mulai:
+                elif mulai and selesai and selesai < mulai:
                     st.error("Tanggal selesai harus setelah tanggal mulai.")
                 else:
                     tambah("Program", {
                         "kode": kode_baru, "nama": nama, "ikon": ikon or "📌", "jenis": "misi",
-                        "poin": int(jml), "aktif": "ya", "mulai": mulai.isoformat(),
+                        "poin": int(jml), "aktif": "ya",
+                        "mulai": mulai.isoformat() if mulai else "",
                         "selesai": selesai.isoformat() if selesai else "",
                         "keterangan": ket, "deskripsi": desk, "frekuensi": frek_baru,
                         "diubah_oleh": st.session_state.nama,
                         "diubah_pada": now_wib().isoformat(timespec="seconds"),
                     })
-                    st.success(f"Misi {nama} ditambahkan.")
+                    st.session_state.misi_baru_ver = vb + 1
+                    st.session_state.misi_baru_ok = f"✅ Misi {nama} ditambahkan."
+                    st.rerun()
 
 
 # ================== ROUTER ==================
