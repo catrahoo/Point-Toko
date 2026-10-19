@@ -73,7 +73,7 @@ def _ambil_sheet_id(teks):
 
 SALES_PASSWORD = secret("SALES_PASSWORD", "sales123")
 SHEET_URL_DEFAULT = ("https://docs.google.com/spreadsheets/d/"
-                     "1RC7v1fGmcz-9q4VowhBnf767P2N_ptonqlKuRSug0Ko/edit")
+                     "1g5cHM2J00thNe-PpfeycufhHLPkpIXV8msewhm_Pf8I/edit")
 SHEET_URL = str(secret("GSHEET_URL", "") or "").strip() or SHEET_URL_DEFAULT
 SHEET_ID = _ambil_sheet_id(secret("GSHEET_ID", "")) or _ambil_sheet_id(SHEET_URL)
 if not SHEET_URL and SHEET_ID:
