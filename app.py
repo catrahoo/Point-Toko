@@ -42,7 +42,7 @@ IMAGE_MAX_PX = 1920
 IMAGE_QUALITY = 75
 
 FOLDER_UTAMA = "Foto Poin Toko"
-FOLDER_MAP = {"Transaksi": "Nota Pembelian", "Misi": "Misi Bonus"}
+FOLDER_MAP = {"Transaksi": "Nota Pembelian", "Misi": "Misi Bonus", "Profil": "Foto Profil"}
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -71,7 +71,8 @@ def _ambil_sheet_id(teks):
     return m.group(1) if m else teks
 
 
-SALES_PASSWORD = secret("SALES_PASSWORD", "sales123")
+# Akun login sales (dikunci di kode)
+SALES_AKUN = {"spv-sby": "sales123"}
 SHEET_URL_DEFAULT = ("https://docs.google.com/spreadsheets/d/"
                      "1g5cHM2J00thNe-PpfeycufhHLPkpIXV8msewhm_Pf8I/edit")
 SHEET_URL = str(secret("GSHEET_URL", "") or "").strip() or SHEET_URL_DEFAULT
@@ -92,14 +93,8 @@ CUSTOMER_SHEET_ID = _ambil_sheet_id(
 PROGRAM_DEFAULT = [
     {"kode": "pembelian", "nama": "Pembelian Nota", "ikon": "🧾", "jenis": "pembelian",
      "poin": 100, "aktif": "ya", "deskripsi": "Poin per pack dari nota pembelian ke sales"},
-    {"kode": "eceran", "nama": "Sedia Eceran", "ikon": "🚬", "jenis": "misi", "poin": 1000,
-     "aktif": "ya", "keterangan": "Brand rokok yang diecer",
-     "deskripsi": "Foto rak/etalase rokok eceran Anda"},
-    {"kode": "sunblind", "nama": "POSM Sunblind", "ikon": "⛱️", "jenis": "misi", "poin": 1000,
-     "aktif": "ya", "deskripsi": "Foto sunblind kami yang terpasang di toko Anda"},
-    {"kode": "stiker", "nama": "POSM Stiker", "ikon": "🏷️", "jenis": "misi", "poin": 500,
-     "aktif": "ya", "deskripsi": "Foto stiker kami yang terpasang di toko Anda"},
 ]
+PROGRAM_DIHAPUS = {"eceran", "sunblind", "stiker"}  # misi contoh lama, dibuang dari sheet
 
 STATUS_LABEL = {
     "pending":  "⏳ Menunggu approval",
@@ -110,7 +105,7 @@ STATUS_LABEL = {
 # Kolom tiap sheet
 COLS = {
     "Toko": ["kode_toko", "nama_toko", "pemilik", "no_hp", "alamat", "pin_hash", "dibuat",
-             "username", "zona", "rayon"],
+             "username", "zona", "rayon", "foto_profil_id"],
     "Transaksi": ["id", "kode_toko", "nama_toko", "no_nota", "tanggal", "jumlah_pack", "poin",
                   "status", "sumber", "deskripsi", "catatan", "sales", "diproses_oleh",
                   "diproses_pada", "dibuat", "foto_id", "foto_link", "ai_pack", "ai_baca",
@@ -690,9 +685,43 @@ def program_df():
                        value_input_option="RAW")
         segarkan()
         df = tabel("Program")
+    if df.kode.isin(PROGRAM_DIHAPUS).any():
+        simpan_program(df[~df.kode.isin(PROGRAM_DIHAPUS)][COLS["Program"]].values.tolist())
+        df = tabel("Program")
     df = df[df.kode.str.strip() != ""].drop_duplicates("kode").copy()
     df["aktif"] = df.aktif.str.strip().str.lower()
     return df.reset_index(drop=True)
+
+
+def simpan_program(rows):
+    """Tulis ulang seluruh sheet Program."""
+    ws = _ws_ensure("Program")
+    ws.clear()
+    bersih = [[v.item() if hasattr(v, "item") else v for v in r] for r in rows]  # numpy -> python
+    ws.update([COLS["Program"]] + bersih, "A1", value_input_option="RAW")
+    segarkan()
+
+
+def periode_program(prog):
+    m, s_ = prog.get("mulai", ""), prog.get("selesai", "")
+    if m and s_:
+        return f"📅 {tgl_id(m)} – {tgl_id(s_)}"
+    if s_:
+        return f"📅 s/d {tgl_id(s_)}"
+    if m:
+        return f"📅 Mulai {tgl_id(m)}"
+    return "📅 Tanpa batas waktu"
+
+
+def judul_program(judul, prog, level=3):
+    """Judul di kiri, periode program di kanan atas."""
+    st.markdown(
+        f"""<div style="display:flex;justify-content:space-between;align-items:flex-start;
+        gap:10px;flex-wrap:wrap"><div style="font-size:{1.6 if level == 3 else 2}rem;
+        font-weight:900;line-height:1.2">{judul}</div>
+        <div style="background:rgba(255,255,255,.15);border:1px solid rgba(255,255,255,.5);
+        border-radius:999px;padding:4px 12px;font-size:.85rem;white-space:nowrap">
+        {periode_program(prog)}</div></div>""", unsafe_allow_html=True)
 
 
 def _status_program(r):
@@ -727,7 +756,10 @@ def poin_per_pack():
 def label_misi(kode):
     df = program_df()
     r = df[df.kode == kode]
-    return f"{r.ikon.iloc[0]} {r.nama.iloc[0]}" if len(r) else f"🎯 {kode}"
+    if len(r):
+        return f"{r.ikon.iloc[0]} {r.nama.iloc[0]}"
+    lama = {"eceran": "🚬 Sedia Eceran", "sunblind": "⛱️ POSM Sunblind", "stiker": "🏷️ POSM Stiker"}
+    return lama.get(kode, f"🎯 {kode}")
 
 
 def tgl_id(iso):
@@ -764,7 +796,9 @@ def tampil_leaderboard(kode_saya):
             f"""<div style="text-align:center;border:1.5px solid rgba(255,255,255,.7);
             border-radius:18px;padding:14px 6px;background:linear-gradient(180deg,
             rgba(74,155,240,.45),rgba(13,47,134,.6));">
-            <div style="font-size:2.4rem;line-height:1">{medali[i]}</div>
+            <div style="font-size:2rem;line-height:1">{medali[i]}</div>
+            <div style="display:flex;justify-content:center;margin-top:6px">
+            {avatar_html(foto_profil_toko(r.kode_toko), r.nama_toko, 64)}</div>
             <div style="font-weight:900;margin-top:6px">{r.nama_toko}{saya}</div>
             <div style="color:#dbe9ff">{poin(r.total)}</div></div>""",
             unsafe_allow_html=True)
@@ -779,6 +813,95 @@ def tampil_leaderboard(kode_saya):
         kurang = max(batas - total + 1, 1)
         st.info(f"Toko Anda di peringkat **{rank}** dari {len(lb)} toko. Kurang "
                 f"**{poin(kurang)}** lagi untuk masuk Top 3! 🚀")
+
+
+# ================== FOTO PROFIL ==================
+def potong_persegi(raw, ukuran=640):
+    """Potong tengah jadi persegi & kecilkan (seperti foto profil WhatsApp)."""
+    img = Image.open(io.BytesIO(raw))
+    try:
+        from PIL import ImageOps
+        img = ImageOps.exif_transpose(img)
+    except Exception:
+        pass
+    img = img.convert("RGB")
+    sisi = min(img.size)
+    kiri, atas = (img.width - sisi) // 2, (img.height - sisi) // 2
+    img = img.crop((kiri, atas, kiri + sisi, atas + sisi)).resize((ukuran, ukuran), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    return buf.getvalue()
+
+
+def avatar_html(foto_id, nama, ukuran=56):
+    """Lingkaran foto profil; inisial nama jika belum ada foto."""
+    b = None
+    if foto_id:
+        try:
+            b = ambil_foto(foto_id)
+        except Exception:
+            b = None
+    gaya = (f"width:{ukuran}px;height:{ukuran}px;border-radius:50%;object-fit:cover;"
+            f"border:2px solid #fff;flex-shrink:0")
+    if b:
+        return (f'<img src="data:image/jpeg;base64,{base64.b64encode(b).decode()}" '
+                f'style="{gaya}">')
+    inisial = "".join(w[0] for w in str(nama).split()[:2]).upper() or "?"
+    return (f'<div style="{gaya};display:flex;align-items:center;justify-content:center;'
+            f'background:#4a9bf0;font-weight:900;font-size:{ukuran * 0.4:.0f}px">{inisial}</div>')
+
+
+def foto_profil_toko(kode):
+    t = tabel("Toko")
+    r = t[t.kode_toko == kode]
+    return r.foto_profil_id.iloc[0] if len(r) else ""
+
+
+def toko_profil():
+    kode = st.session_state.kode_toko
+    st.subheader("👤 Profil Toko")
+    fid = foto_profil_toko(kode)
+    st.markdown(
+        f'<div style="display:flex;justify-content:center;margin:10px 0 6px">'
+        f'{avatar_html(fid, st.session_state.nama, 160)}</div>'
+        f'<div style="text-align:center;font-weight:900;font-size:1.3rem">'
+        f'{st.session_state.nama}</div>', unsafe_allow_html=True)
+
+    st.markdown("**Ganti foto profil**")
+    v = st.session_state.setdefault("profil_ver", 0)
+    cara = st.radio("Ambil dari", ["🖼️ Galeri", "📷 Kamera"], horizontal=True,
+                    key=f"profil_cara{v}")
+    f = (st.file_uploader("Pilih foto", type=["jpg", "jpeg", "png"], key=f"profil_up{v}")
+         if cara.startswith("🖼️") else st.camera_input("Foto profil", key=f"profil_cam{v}"))
+    if f is not None:
+        try:
+            data = potong_persegi(f.getvalue())
+        except Exception:
+            st.error("File ini bukan gambar yang bisa dibaca. Pilih foto lain.")
+            return
+        st.markdown(
+            f'<div style="display:flex;justify-content:center">'
+            f'<img src="data:image/jpeg;base64,{base64.b64encode(data).decode()}" '
+            f'style="width:160px;height:160px;border-radius:50%;object-fit:cover;'
+            f'border:2px solid #fff"></div>', unsafe_allow_html=True)
+        st.caption("Pratinjau: foto dipotong bulat seperti foto profil WhatsApp.")
+        if st.button("💾 Simpan foto profil", type="primary", use_container_width=True):
+            with st.spinner("Menyimpan..."):
+                try:
+                    baru, _ = _upload_foto(data, f"{kode}_profil_{now_wib():%Y%m%d_%H%M%S}.jpg",
+                                           "Profil")
+                except Exception as e:
+                    st.error(f"❌ Foto profil gagal disimpan: {e}")
+                    return
+                ubah("Toko", "kode_toko", kode, {"foto_profil_id": baru})
+                if fid:
+                    try:
+                        _foto_api("delete", id=fid)
+                    except Exception:
+                        pass
+            st.session_state.profil_ver = v + 1
+            st.toast("Foto profil diperbarui!")
+            st.rerun()
 
 
 # ================== HELPER ==================
@@ -871,14 +994,14 @@ def halaman_login():
 
     with tab_sales:
         with st.form("login_sales"):
-            nama = st.text_input("Nama Sales").strip()
+            nama = st.text_input("Username").strip().lower()
             pw = st.text_input("Password", type="password")
             if st.form_submit_button("Masuk", use_container_width=True):
-                if pw == SALES_PASSWORD and nama:
+                if nama in SALES_AKUN and pw == SALES_AKUN[nama]:
                     st.session_state.update(role="sales", nama=nama)
                     st.rerun()
                 else:
-                    st.error("Nama wajib diisi dan password harus benar.")
+                    st.error("Username atau password salah.")
 
     st.markdown(
         '<div class="footer-note">Kumpulkan poin dari setiap pembelian, '
@@ -889,7 +1012,13 @@ def halaman_login():
 
 def tombol_keluar():
     with st.sidebar:
-        st.write(f"👤 **{st.session_state.nama}**")
+        if st.session_state.get("role") == "toko":
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">'
+                f'{avatar_html(foto_profil_toko(st.session_state.kode_toko), st.session_state.nama, 52)}'
+                f'<b>{st.session_state.nama}</b></div>', unsafe_allow_html=True)
+        else:
+            st.write(f"👤 **{st.session_state.nama}**")
         if st.button("🔄 Muat ulang data", use_container_width=True):
             segarkan()
             st.rerun()
@@ -1238,7 +1367,11 @@ def sales_penukaran():
 # ================== HALAMAN TOKO ==================
 def toko_saldo():
     kode = st.session_state.kode_toko
-    st.title(f"🏪 {st.session_state.nama}")
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:14px;margin:6px 0 14px">'
+        f'{avatar_html(foto_profil_toko(kode), st.session_state.nama, 72)}'
+        f'<div style="font-size:2rem;font-weight:900;line-height:1.1">'
+        f'{st.session_state.nama}</div></div>', unsafe_allow_html=True)
     masuk, keluar, saldo = saldo_toko(kode)
 
     st.metric("💰 Saldo Poin Anda", poin(saldo))
@@ -1308,16 +1441,16 @@ def toko_saldo():
 
 def toko_tambah_poin():
     kode = st.session_state.kode_toko
-    st.subheader("➕ Tambahkan Poin dari Pembelian ke Sales")
     prog = program_berjalan("pembelian")
     if not prog:
+        st.subheader("➕ Tambahkan Poin dari Pembelian ke Sales")
         st.info("Program poin pembelian sedang tidak berjalan. Pantau terus info dari sales kami ya! 🙏")
         return
+    judul_program("➕ Tambahkan Poin dari Pembelian ke Sales", prog)
     pp = int(prog["poin"])
-    sampai = f" · berlaku s/d {tgl_id(prog['selesai'])}" if prog["selesai"] else ""
     st.caption(
-        f"1 pack = {pp} poin · min {MIN_PACK} pack, max {MAX_PACK} pack (1 slop) per nota"
-        f"{sampai}. Poin masuk setelah disetujui sales."
+        f"1 pack = {pp} poin · min {MIN_PACK} pack, max {MAX_PACK} pack (1 slop) per nota. "
+        "Poin masuk setelah disetujui sales."
     )
 
     if st.session_state.pop("toko_kirim_ok", None):
@@ -1408,10 +1541,9 @@ def kartu_misi(kode, prog):
     jenis = prog["kode"]
     _, senin_depan = minggu_ini()
     with st.container(border=True):
-        st.markdown(f"### {prog['ikon']} {prog['nama']} · +{poin(prog['poin'])}")
+        judul_program(f"{prog['ikon']} {prog['nama']} · +{poin(prog['poin'])}", prog)
         if prog["deskripsi"]:
-            st.caption(prog["deskripsi"] + (f" · berlaku s/d {tgl_id(prog['selesai'])}"
-                                            if prog["selesai"] else ""))
+            st.caption(prog["deskripsi"])
         status = status_misi_minggu_ini(kode, jenis)
         if status == "pending":
             st.info("⏳ Sudah dikirim minggu ini, menunggu konfirmasi sales.")
@@ -1547,12 +1679,21 @@ def sales_program():
             st.error("Tanggal mulai lebih besar dari tanggal selesai: " + ", ".join(salah))
         else:
             with st.spinner("Menyimpan..."):
-                ws = _ws_ensure("Program")
-                ws.clear()
-                ws.update([COLS["Program"]] + rows, "A1", value_input_option="RAW")
-            segarkan()
+                simpan_program(rows)
             st.success("✅ Program tersimpan.")
             st.rerun()
+
+    misi_ada = df[df.jenis == "misi"]
+    if not misi_ada.empty:
+        with st.expander("🗑️ Hapus program misi"):
+            opsi = {f"{r.ikon} {r.nama}": r.kode for r in misi_ada.itertuples()}
+            pilih = st.selectbox("Pilih program", list(opsi.keys()), key="hapus_prog")
+            st.caption("Riwayat poin toko dari program ini tetap tersimpan.")
+            if st.button("Hapus program ini", key="btn_hapus_prog"):
+                with st.spinner("Menghapus..."):
+                    simpan_program(df[df.kode != opsi[pilih]][COLS["Program"]].values.tolist())
+                st.success(f"Program {pilih} dihapus.")
+                st.rerun()
 
     with st.expander("➕ Tambah misi foto baru"):
         with st.form("form_misi_baru", clear_on_submit=True):
@@ -1599,12 +1740,11 @@ def halaman_belum_setup():
     st.write(f"**Secret yang terbaca:** {', '.join(atas) or '(kosong)'}")
     if dalam:
         st.write(f"**Isi [gcp_json]:** {', '.join(dalam)}")
-    st.info("Tulis SALES_PASSWORD, GSHEET_ID, GSHEET_URL, GEMINI_API_KEY di PALING ATAS, "
+    st.info("Tulis GSHEET_ID, GSHEET_URL, GEMINI_API_KEY di PALING ATAS, "
             "sebelum baris [gcp_json].")
     st.markdown(
         "Isi **Settings → Secrets** di Streamlit Cloud dengan:\n\n"
         "```toml\n"
-        'SALES_PASSWORD = "password-sales"\n'
         'GSHEET_ID = "spreadsheet-id-dari-url"\n'
         'GSHEET_URL = "https://docs.google.com/spreadsheets/d/.../edit"\n'
         'GEMINI_API_KEY = "AIza..."  # opsional\n'
@@ -1637,9 +1777,10 @@ def main():
         return
     tombol_keluar()
     if role == "toko":
-        menu = st.sidebar.radio("Menu", ["Saldo Poin", "Tambah Poin", "Misi Bonus"])
+        menu = st.sidebar.radio("Menu", ["Saldo Poin", "Tambah Poin", "Misi Bonus",
+                                         "Profil"])
         {"Saldo Poin": toko_saldo, "Tambah Poin": toko_tambah_poin,
-         "Misi Bonus": toko_misi}[menu]()
+         "Misi Bonus": toko_misi, "Profil": toko_profil}[menu]()
     else:
         if not (FOTO_SCRIPT_URL and FOTO_TOKEN):
             st.sidebar.error("📷 Penyimpanan foto belum diatur (FOTO_SCRIPT_URL / FOTO_TOKEN).")
