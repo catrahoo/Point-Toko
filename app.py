@@ -10,6 +10,7 @@ import hmac
 import time
 import io
 import json
+import math
 import re
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -22,6 +23,11 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from PIL import Image
+
+try:  # ambil lokasi GPS dari browser
+    from streamlit_js_eval import get_geolocation
+except ImportError:
+    get_geolocation = None
 
 WIB = ZoneInfo("Asia/Jakarta")
 
@@ -135,7 +141,8 @@ COLS = {
     "Klaim": ["id", "kode_toko", "nama_toko", "hadiah_id", "nama_hadiah", "poin", "status",
               "catatan", "dibuat", "diproses_oleh", "diproses_pada", "diserahkan_oleh",
               "diserahkan_pada", "kode_klaim", "nama_penerima", "foto_serah_id",
-              "foto_serah_link"],
+              "foto_serah_link", "pengantar", "lat_serah", "lon_serah", "akurasi_m",
+              "jarak_toko_m"],
 }
 KOLOM_ANGKA = {"jumlah_pack", "poin", "ai_pack"}
 
@@ -316,6 +323,62 @@ def _cari_kolom(cols, *kandidat, exact=()):
     return None
 
 
+def _parse_koordinat(series, is_lat=True):
+    """Perbaiki format koordinat (koma, titik hilang) seperti di app Cek Koordinat."""
+    batas = 90 if is_lat else 180
+
+    def satu(val):
+        s_ = str(val).strip()
+        if s_ in ("", "nan", "None", "NaN", "-", "+"):
+            return float("nan")
+        try:
+            n = float(s_.replace(",", "."))
+            if -batas <= n <= batas:
+                return n
+        except ValueError:
+            pass
+        tanda = -1 if s_.lstrip().startswith("-") else 1
+        digit = re.sub(r"[^\d]", "", s_)
+        for i in range(1, len(digit)):
+            try:
+                c = tanda * float(f"{digit[:i]}.{digit[i:]}")
+                if -batas <= c <= batas:
+                    return c
+            except ValueError:
+                continue
+        return float("nan")
+    return series.apply(satu)
+
+
+def jarak_meter(lat1, lon1, lat2, lon2):
+    r = 6371000
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def info_lokasi_toko(kode):
+    """Zona, rayon, alamat & koordinat toko dari master customer (fallback: tab Toko)."""
+    hasil = {"zona": "", "rayon": "", "alamat": "", "lat": None, "lon": None}
+    t = tabel("Toko")
+    r = t[t.kode_toko.str.upper() == str(kode).upper()]
+    if len(r):
+        hasil.update(zona=r.zona.iloc[0], rayon=r.rayon.iloc[0], alamat=r.alamat.iloc[0])
+    try:
+        c = load_customers()
+        m = c[c.kode.str.upper() == str(kode).upper()]
+        if len(m):
+            m = m.iloc[0]
+            hasil.update(zona=m.zona or hasil["zona"], rayon=m.rayon or hasil["rayon"],
+                         alamat=m.alamat or hasil["alamat"])
+            if pd.notna(m.lat) and pd.notna(m.lon):
+                hasil.update(lat=float(m.lat), lon=float(m.lon))
+    except Exception:
+        pass
+    return hasil
+
+
 @st.cache_data(ttl=600, show_spinner="Memuat master customer...")
 def load_customers():
     """Customer aktif dari master sheet: kode, nama, alamat, zona, rayon, label."""
@@ -332,6 +395,8 @@ def load_customers():
     group_col = _cari_kolom(cols, "salesgroup")
     district_col = _cari_kolom(cols, "salesdistrict")
     status_col = _cari_kolom(cols, exact=("status",))
+    lat_col = _cari_kolom(cols, "latitude", exact=("latitude",))
+    lon_col = _cari_kolom(cols, "longitude", exact=("longitude",))
 
     if status_col:
         df = df[df[status_col].str.strip().str.lower() == "aktif"]
@@ -342,6 +407,8 @@ def load_customers():
         "alamat": df[addr_col].astype(str).str.strip() if addr_col else "",
         "zona": df[district_col].map(lambda v: _with_prefix(v, "ZONA")) if district_col else "",
         "rayon": df[group_col].map(lambda v: _with_prefix(v, "RAYON")) if group_col else "",
+        "lat": _parse_koordinat(df[lat_col], True) if lat_col else float("nan"),
+        "lon": _parse_koordinat(df[lon_col], False) if lon_col else float("nan"),
     })
     out = out[out.kode != ""].drop_duplicates("kode")
 
@@ -1119,6 +1186,35 @@ def sales_approval_hadiah():
     daftar_serah(k)
 
 
+JARAK_WAJAR_M = 300  # lebih jauh dari ini dari titik toko -> ditandai
+
+
+def ambil_gps(key, lok):
+    """Lokasi pengantar saat ini dari browser. Return dict atau None."""
+    if get_geolocation is None:
+        st.error("Fitur lokasi belum terpasang (tambahkan streamlit-js-eval di requirements.txt).")
+        return None
+    data = get_geolocation(component_key=key)
+    coords = (data or {}).get("coords") if isinstance(data, dict) else None
+    if not coords:
+        st.info("📍 Mengambil lokasi Anda… Jika muncul pertanyaan izin lokasi, pilih **Izinkan**. "
+                "Pastikan GPS/Lokasi HP aktif.")
+        return None
+    lat, lon = float(coords["latitude"]), float(coords["longitude"])
+    akurasi = float(coords.get("accuracy") or 0)
+    jarak = (jarak_meter(lat, lon, lok["lat"], lok["lon"])
+             if lok.get("lat") is not None else None)
+    teks = f"✅ Lokasi terkunci (akurasi ±{akurasi:.0f} m)"
+    if jarak is None:
+        st.success(teks + " · koordinat toko tidak tersedia untuk dibandingkan")
+    elif jarak <= JARAK_WAJAR_M:
+        st.success(teks + f" · {jarak:.0f} m dari titik toko")
+    else:
+        st.warning(teks + f" · ⚠️ {jarak:,.0f} m dari titik toko. Pastikan Anda benar-benar "
+                   "di toko; jarak ini tercatat dan terlihat oleh SPV.".replace(",", "."))
+    return {"lat": lat, "lon": lon, "akurasi": akurasi, "jarak": jarak}
+
+
 def daftar_serah(k):
     """Daftar hadiah disetujui yang menunggu diantar + form bukti serah (SPV & promotor)."""
     siap = k[k.status == "approved"].sort_values("diproses_pada")
@@ -1134,16 +1230,33 @@ def daftar_serah(k):
             if not kode_k:
                 kode_k = buat_kode_klaim()
                 ubah("Klaim", "id", r.id, {"kode_klaim": kode_k})
+            lok = info_lokasi_toko(r.kode_toko)
             with st.container(border=True):
                 st.markdown(f"**{r.nama_hadiah}** → {r.nama_toko} ({r.kode_toko}) · "
                             f"disetujui {waktu(r.diproses_pada)}")
+                st.markdown(f"🗺️ **{lok['zona'] or 'Zona -'}**"
+                            + (f" · {lok['rayon']}" if lok["rayon"] else "")
+                            + (f"  \n📍 {lok['alamat']}" if lok["alamat"] else ""))
+                if lok["lat"] is not None:
+                    m1, m2 = st.columns(2)
+                    m1.link_button("📍 Lihat Lokasi", "https://www.google.com/maps/search/?api=1"
+                                   f"&query={lok['lat']},{lok['lon']}", use_container_width=True)
+                    m2.link_button("🧭 Arahkan ke Toko", "https://www.google.com/maps/dir/?api=1"
+                                   f"&destination={lok['lat']},{lok['lon']}&travelmode=driving",
+                                   use_container_width=True)
+                else:
+                    st.caption("Koordinat toko belum ada di master customer.")
                 if st.session_state.get("serah_buka") != r.id:
                     if st.button("📦 Serahkan hadiah", key=f"hsr{r.id}", use_container_width=True):
                         st.session_state.serah_buka = r.id
                         st.rerun()
                     continue
                 st.caption(f"Kode hadiah: **{kode_k}**")
+                pengantar = st.session_state.nama
+                if st.session_state.get("role") == "promotor":
+                    pengantar = st.text_input("Nama promotor pengantar *", key=f"sp{r.id}").strip()
                 penerima = st.text_input("Nama penerima *", key=f"sn{r.id}").strip()
+                gps = ambil_gps(f"geo_{r.id}", lok)
                 foto = ambil_foto_langsung(f"serah_{r.id}",
                                            "📷 Foto penerima bersama hadiah")
                 b1, b2 = st.columns(2)
@@ -1152,8 +1265,13 @@ def daftar_serah(k):
                     st.rerun()
                 if b1.button("✅ Konfirmasi diserahkan", key=f"sok{r.id}", type="primary",
                              use_container_width=True):
-                    if not penerima:
+                    if not pengantar:
+                        st.error("Isi nama promotor pengantar.")
+                    elif not penerima:
                         st.error("Isi nama penerima.")
+                    elif gps is None:
+                        st.error("Lokasi GPS belum didapat. Izinkan akses lokasi lalu tunggu "
+                                 "sampai muncul ✅ Lokasi terkunci.")
                     elif foto is None:
                         st.error("Ambil foto penerima bersama hadiah.")
                     else:
@@ -1166,7 +1284,10 @@ def daftar_serah(k):
                             "status": "diserahkan", "diserahkan_oleh": st.session_state.nama,
                             "diserahkan_pada": now.isoformat(timespec="seconds"),
                             "nama_penerima": penerima, "foto_serah_id": fid,
-                            "foto_serah_link": furl})
+                            "foto_serah_link": furl, "pengantar": pengantar,
+                            "lat_serah": f"{gps['lat']:.6f}", "lon_serah": f"{gps['lon']:.6f}",
+                            "akurasi_m": str(int(gps["akurasi"])),
+                            "jarak_toko_m": "" if gps["jarak"] is None else str(int(gps["jarak"]))})
                         st.session_state.pop("serah_buka", None)
                         st.toast(f"📦 {kode_k} diserahkan ke {penerima}")
                         st.rerun()
@@ -1175,15 +1296,22 @@ def daftar_serah(k):
 def promotor_kirim():
     st.subheader("🚚 Kirim Reward ke Toko")
     st.caption("Antar hadiah ke toko, lalu isi nama penerima dan foto penerima bersama hadiah.")
-    toko = tabel("Toko")[["kode_toko", "alamat", "no_hp"]]
+    toko = tabel("Toko")[["kode_toko", "no_hp"]]
     k = tabel("Klaim")
-    siap = k[k.status == "approved"]
-    if not siap.empty:
-        info = siap.merge(toko, on="kode_toko", how="left").fillna("")
-        st.dataframe(pd.DataFrame({
-            "Kode": info.kode_klaim, "Toko": info.nama_toko, "Hadiah": info.nama_hadiah,
-            "Alamat": info.alamat, "HP": info.no_hp}), hide_index=True, use_container_width=True)
-    daftar_serah(k)
+    siap = k[k.status == "approved"].copy()
+    if siap.empty:
+        daftar_serah(k)
+        return
+    siap["zona"] = siap.kode_toko.map(lambda x: info_lokasi_toko(x)["zona"] or "Zona -")
+    zona_ada = sorted(siap.zona.unique())
+    pilih = st.multiselect("Filter zona (kosongkan = semua zona)", zona_ada, key="prom_zona")
+    if pilih:
+        siap = siap[siap.zona.isin(pilih)]
+    info = siap.merge(toko, on="kode_toko", how="left").fillna("")
+    st.dataframe(pd.DataFrame({
+        "Zona": info.zona, "Kode": info.kode_klaim, "Toko": info.nama_toko,
+        "Hadiah": info.nama_hadiah, "HP": info.no_hp}), hide_index=True, use_container_width=True)
+    daftar_serah(siap)
 
 
 def promotor_riwayat():
@@ -1219,7 +1347,8 @@ def sales_riwayat_hadiah():
         "Poin": k.poin, "Status": k.status.map(STATUS_LABEL),
         "Diajukan": k.dibuat.map(waktu), "Disetujui": k.diproses_pada.map(waktu),
         "Diserahkan": k.diserahkan_pada.map(waktu), "Penerima": k.nama_penerima,
-        "Oleh": k.diserahkan_oleh}), hide_index=True, use_container_width=True)
+        "Pengantar": k.pengantar.where(k.pengantar != "", k.diserahkan_oleh),
+        "Jarak ke toko (m)": k.jarak_toko_m}), hide_index=True, use_container_width=True)
     st.download_button("⬇️ Download CSV", k.drop(columns=["foto_serah_id"]).to_csv(index=False)
                        .encode(), "riwayat_hadiah.csv", "text/csv")
     if k.empty:
@@ -1236,8 +1365,21 @@ def sales_riwayat_hadiah():
         st.markdown(
             f"- 📝 Diajukan toko: {waktu(r.dibuat) or '-'}\n"
             f"- ✅ Diproses: {waktu(r.diproses_pada) or '-'} oleh {r.diproses_oleh or '-'}\n"
-            f"- 📦 Diserahkan: {waktu(r.diserahkan_pada) or '-'} oleh {r.diserahkan_oleh or '-'}"
-            f", diterima **{r.nama_penerima or '-'}**")
+            f"- 📦 Diserahkan: {waktu(r.diserahkan_pada) or '-'} oleh "
+            f"{r.pengantar or r.diserahkan_oleh or '-'}"
+            + (f" (akun {r.diserahkan_oleh})" if r.pengantar and r.pengantar != r.diserahkan_oleh
+               else "") + f", diterima **{r.nama_penerima or '-'}**")
+        if r.lat_serah:
+            jarak = (f" · {int(float(r.jarak_toko_m)):,} m dari titik toko".replace(",", ".")
+                     if r.jarak_toko_m else "")
+            pesan = (f"📍 Lokasi saat diserahkan: `{r.lat_serah}, {r.lon_serah}` "
+                     f"(akurasi ±{r.akurasi_m} m){jarak}")
+            if r.jarak_toko_m and float(r.jarak_toko_m) > JARAK_WAJAR_M:
+                st.warning(pesan + " ⚠️ jauh dari toko")
+            else:
+                st.info(pesan)
+            st.link_button("🗺️ Lihat titik serah di peta", "https://www.google.com/maps/search/"
+                           f"?api=1&query={r.lat_serah},{r.lon_serah}")
         if r.catatan:
             st.caption(f"Catatan: {r.catatan}")
         if r.foto_serah_id:
