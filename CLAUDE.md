@@ -26,3 +26,6 @@ pip install -r requirements.txt pytest
 pytest
 ```
 GitHub Actions menjalankan test yang sama setiap ada push.
+
+## Monitoring
+`monitor.py` mengirim notif WhatsApp (CallMeBot) setiap ada error yang tidak tertangkap. Dipasang lewat `monitor.pasang(...)` di bagian atas `app.py`, dan nomor + apikey diambil dari secrets `[callmebot]`. Jangan hapus baris itu.

@@ -24,6 +24,9 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 from PIL import Image
 
+import monitor
+monitor.pasang("Poin Toko")  # notif WA kalau app error
+
 try:  # ambil lokasi GPS dari browser
     from streamlit_js_eval import get_geolocation
 except ImportError:
