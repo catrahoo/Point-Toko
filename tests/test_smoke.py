@@ -25,5 +25,7 @@ def test_aplikasi_bisa_start_tanpa_secrets():
     pytest.importorskip("streamlit")
     from streamlit.testing.v1 import AppTest
 
-    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
+    at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60)
+    at.secrets["_CI"] = "1"   # secrets ada tapi belum diisi (seperti app baru di Streamlit Cloud)
+    at.run()
     assert not at.exception, [e.message for e in at.exception]
