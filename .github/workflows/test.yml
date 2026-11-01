@@ -1,0 +1,23 @@
+name: Test
+
+# Jalan otomatis tiap ada perubahan yang di-push atau Pull Request.
+# Hasilnya terlihat di tab Actions: centang hijau = aman, silang merah = ada yang rusak.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -r requirements.txt pytest
+      - name: Jalankan test
+        run: pytest -v
