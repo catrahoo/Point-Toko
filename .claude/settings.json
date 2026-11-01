@@ -1,0 +1,16 @@
+{
+  "extraKnownMarketplaces": {
+    "anti-slop-skills": {
+      "source": { "source": "github", "repo": "catrahoo/anti-slop-skills" }
+    }
+  },
+  "enabledPlugins": {
+    "taste-skill@anti-slop-skills": true,
+    "antislop@anti-slop-skills": true,
+    "impeccable@anti-slop-skills": true,
+    "humanizer@anti-slop-skills": true,
+    "stop-slop@anti-slop-skills": true,
+    "no-ai-slop@anti-slop-skills": true,
+    "avoid-ai-writing@anti-slop-skills": true
+  }
+}
