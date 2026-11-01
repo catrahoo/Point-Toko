@@ -82,16 +82,21 @@ def pasang(nama_app: str) -> None:
         return
     try:
         from streamlit.runtime.scriptrunner import exec_code
-        asli = exec_code.handle_uncaught_app_exception
+    except Exception:
+        return  # versi Streamlit berbeda: monitoring nonaktif, aplikasi tetap jalan
 
-        def dengan_notif(ex):
+    def bungkus(asli):
+        def dengan_notif(ex, *args, **kwargs):
             try:
                 lapor_error(ex, nama_app)
             except Exception:
                 pass
-            asli(ex)
+            return asli(ex, *args, **kwargs)
+        return dengan_notif
 
-        exec_code.handle_uncaught_app_exception = dengan_notif
-        _terpasang = True
-    except Exception:
-        pass  # versi Streamlit berbeda: monitoring nonaktif, aplikasi tetap jalan
+    # Streamlit >= 1.5x: handle_user_script_exception; versi lama: handle_uncaught_app_exception
+    for nama in ("handle_user_script_exception", "handle_uncaught_app_exception"):
+        if hasattr(exec_code, nama):
+            setattr(exec_code, nama, bungkus(getattr(exec_code, nama)))
+            _terpasang = True
+            return
